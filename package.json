@@ -1,5 +1,15 @@
-   {
-     "name": "code-mail-server",
-     "version": "1.0.0",
-     "dependencies": { "ws": "^8.16.0" }
-   }
+{
+  "name": "talkie-talkie-signaling",
+  "version": "1.0.0",
+  "description": "Signaling server for talkie-talkie (mesh WebRTC group chat)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
