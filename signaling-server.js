@@ -1,105 +1,131 @@
-/**
- * code-mail 시그널링 서버 (최소 구현)
- * ------------------------------------------------------
- * 역할: 두 클라이언트가 서로의 SDP(offer/answer)와 ICE candidate를
- *       교환할 수 있도록 "룸" 단위로 메시지를 중계만 함.
- *       실제 텍스트/파일 데이터는 이 서버를 거치지 않고,
- *       핸드셰이크 완료 후 RTCDataChannel로 P2P 직접 전송됨.
- *
- * 설치:
- *   npm init -y
- *   npm install ws
- *
- * 실행:
- *   node signaling-server.js
- *   (기본 포트 8080, 환경변수 PORT로 변경 가능)
- *
- * 배포:
- *   두 사용자가 서로 다른 네트워크(가정용 와이파이, LTE 등)에 있다면
- *   이 서버가 공인 인터넷에서 접근 가능해야 함.
- *   - Render / Railway / Fly.io 같은 무료 티어에 배포하거나
- *   - 자체 VPS에 두고 TLS(wss://)를 적용해서 사용 권장
- *   - 같은 로컬 네트워크(LAN) 테스트라면 PC의 사설 IP로도 충분함
- *     (예: ws://192.168.0.10:8080)
- *
- * 클라이언트(code-mail.html)의 "고급 설정 > 시그널링 서버 주소"에
- * 이 서버의 접속 주소(ws:// 또는 wss://)를 입력하면 됨.
- */
+// talkie-talkie signaling server
+// ------------------------------------------------------------------
+// Implements the protocol expected by talkie-talkie.html:
+//
+//   C->S  {type:'join', room:'global'}
+//   S->C  {type:'welcome', id, label, peers:[{id,label}, ...]}
+//   S->C  {type:'peer-joined', id, label}
+//   S->C  {type:'peer-left', id}
+//   S->C  {type:'room-full'}
+//   C->S  {type:'signal', to:<peerId>, kind:'offer'|'answer'|'ice', payload}
+//   S->C  {type:'signal', from:<peerId>, kind:'offer'|'answer'|'ice', payload}
+//
+// The server does NOT relay chat messages or files at all -- those travel
+// directly peer-to-peer over WebRTC data channels once connected. This
+// server only introduces peers to each other and assigns each one a
+// unique label from the 13-card pool (A,2-10,J,Q,K), max 13 members.
+// ------------------------------------------------------------------
 
+const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const PORT = process.env.PORT || 10000;
+const LABEL_POOL = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const MAX_PEERS = LABEL_POOL.length;
+const HEARTBEAT_MS = 30000;
 
-// roomId -> Set<WebSocket>
-const rooms = new Map();
+// single global room: id -> { ws, label }
+const clients = new Map();
 
-function broadcastToRoom(roomId, senderWs, payload) {
-  const set = rooms.get(roomId);
-  if (!set) return;
-  const msg = JSON.stringify(payload);
-  for (const peer of set) {
-    if (peer !== senderWs && peer.readyState === WebSocket.OPEN) {
-      peer.send(msg);
-    }
+function randomId(){
+  return crypto.randomBytes(8).toString('hex');
+}
+
+function pickLabel(){
+  const used = new Set([...clients.values()].map(c => c.label));
+  return LABEL_POOL.find(l => !used.has(l)) || null;
+}
+
+function send(ws, obj){
+  if(ws.readyState === WebSocket.OPEN){
+    ws.send(JSON.stringify(obj));
   }
 }
 
+function broadcast(obj, exceptId){
+  clients.forEach((c, id) => {
+    if(id !== exceptId) send(c.ws, obj);
+  });
+}
+
+function removeClient(id){
+  const c = clients.get(id);
+  if(!c) return;
+  clients.delete(id);
+  broadcast({ type: 'peer-left', id }, null);
+  console.log(`[leave] ${id} (${c.label}) — ${clients.size} online`);
+}
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('talkie-talkie signaling server is running.\n');
+});
+
+const wss = new WebSocket.Server({ server });
+
 wss.on('connection', (ws) => {
-  ws.room = null;
+  let myId = null;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      return; // 잘못된 형식은 무시
-    }
+    try{ data = JSON.parse(raw); }catch(e){ return; }
 
-    // 1) 룸 참가
-    if (data.type === 'join') {
-      const roomId = data.room;
-      if (!roomId) return;
-
-      if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-      const set = rooms.get(roomId);
-
-      if (set.size >= 2) {
-        ws.send(JSON.stringify({ type: 'room-full' }));
+    if(data.type === 'join'){
+      if(myId) return; // already joined
+      if(clients.size >= MAX_PEERS){
+        send(ws, { type: 'room-full' });
         return;
       }
-
-      ws.room = roomId;
-      set.add(ws);
-
-      // 이미 있던 상대에게 알림
-      broadcastToRoom(roomId, ws, { type: 'peer-joined' });
-
-      // 두 명이 다 모이면 양쪽 모두에게 협상 시작 신호
-      if (set.size === 2) {
-        for (const peer of set) {
-          peer.send(JSON.stringify({ type: 'ready' }));
-        }
+      const label = pickLabel();
+      if(!label){
+        send(ws, { type: 'room-full' });
+        return;
       }
+      myId = randomId();
+      clients.set(myId, { ws, label });
+
+      const peers = [...clients.entries()]
+        .filter(([id]) => id !== myId)
+        .map(([id, c]) => ({ id, label: c.label }));
+
+      send(ws, { type: 'welcome', id: myId, label, peers });
+      broadcast({ type: 'peer-joined', id: myId, label }, myId);
+      console.log(`[join] ${myId} (${label}) — ${clients.size} online`);
       return;
     }
 
-    // 2) offer / answer / ice-candidate 중계
-    if (['offer', 'answer', 'ice'].includes(data.type)) {
-      if (!ws.room) return;
-      broadcastToRoom(ws.room, ws, data);
+    if(data.type === 'signal'){
+      if(!myId) return;
+      const target = clients.get(data.to);
+      if(!target) return;
+      send(target.ws, {
+        type: 'signal',
+        from: myId,
+        kind: data.kind,
+        payload: data.payload
+      });
       return;
     }
   });
 
-  ws.on('close', () => {
-    if (!ws.room) return;
-    const set = rooms.get(ws.room);
-    if (!set) return;
-    set.delete(ws);
-    broadcastToRoom(ws.room, ws, { type: 'peer-left' });
-    if (set.size === 0) rooms.delete(ws.room);
-  });
+  ws.on('close', () => { if(myId) removeClient(myId); });
+  ws.on('error', () => { if(myId) removeClient(myId); });
 });
 
-console.log('code-mail signaling server listening on port ' + PORT);
+// heartbeat: drop dead sockets (helps on hosts that idle-timeout connections)
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if(ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_MS);
+
+wss.on('close', () => clearInterval(heartbeat));
+
+server.listen(PORT, () => {
+  console.log(`talkie-talkie signaling server listening on :${PORT}`);
+});
