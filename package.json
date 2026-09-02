@@ -1,13 +1,10 @@
 {
-  "name": "talkie-talkie-signaling",
+  "name": "talkie-signaling-server",
   "version": "1.0.0",
-  "description": "Signaling server for talkie-talkie (mesh WebRTC group chat)",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
   },
   "dependencies": {
     "ws": "^8.18.0"
