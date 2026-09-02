@@ -1,131 +1,89 @@
-// talkie-talkie signaling server
-// ------------------------------------------------------------------
-// Implements the protocol expected by talkie-talkie.html:
-//
-//   C->S  {type:'join', room:'global'}
-//   S->C  {type:'welcome', id, label, peers:[{id,label}, ...]}
-//   S->C  {type:'peer-joined', id, label}
+// Talkie signaling server
+// Implements exactly the protocol documented in the client:
+//   C->S  {type:'join', room:'lobby', password:<string>}
+//   S->C  {type:'welcome', id, peers:[{id}, ...]}   -- only if password is correct
+//   S->C  {type:'auth-error'}                        -- if password is wrong, then closes
+//   S->C  {type:'peer-joined', id}
 //   S->C  {type:'peer-left', id}
-//   S->C  {type:'room-full'}
 //   C->S  {type:'signal', to:<peerId>, kind:'offer'|'answer'|'ice', payload}
 //   S->C  {type:'signal', from:<peerId>, kind:'offer'|'answer'|'ice', payload}
 //
-// The server does NOT relay chat messages or files at all -- those travel
-// directly peer-to-peer over WebRTC data channels once connected. This
-// server only introduces peers to each other and assigns each one a
-// unique label from the 13-card pool (A,2-10,J,Q,K), max 13 members.
-// ------------------------------------------------------------------
+// The password is checked here, server-side, so no client can ever bypass it
+// by editing/inspecting the page. Prefer setting it via the TALKIE_PASSWORD
+// environment variable in your host's dashboard (e.g. Render > Environment)
+// rather than relying on the fallback below — if this file lives in a public
+// GitHub repo, a hardcoded password here is just as exposed as it was in the
+// old client-side check.
 
 const http = require('http');
-const crypto = require('crypto');
-const WebSocket = require('ws');
+const { WebSocketServer } = require('ws');
 
+const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const PORT = process.env.PORT || 10000;
-const LABEL_POOL = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
-const MAX_PEERS = LABEL_POOL.length;
-const HEARTBEAT_MS = 30000;
-
-// single global room: id -> { ws, label }
-const clients = new Map();
-
-function randomId(){
-  return crypto.randomBytes(8).toString('hex');
-}
-
-function pickLabel(){
-  const used = new Set([...clients.values()].map(c => c.label));
-  return LABEL_POOL.find(l => !used.has(l)) || null;
-}
-
-function send(ws, obj){
-  if(ws.readyState === WebSocket.OPEN){
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-function broadcast(obj, exceptId){
-  clients.forEach((c, id) => {
-    if(id !== exceptId) send(c.ws, obj);
-  });
-}
-
-function removeClient(id){
-  const c = clients.get(id);
-  if(!c) return;
-  clients.delete(id);
-  broadcast({ type: 'peer-left', id }, null);
-  console.log(`[leave] ${id} (${c.label}) — ${clients.size} online`);
-}
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('talkie-talkie signaling server is running.\n');
+  res.end('Talkie signaling server OK');
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
+
+let nextId = 1;
+const clients = new Map(); // id -> ws
+
+function send(ws, obj) {
+  try { ws.send(JSON.stringify(obj)); } catch (e) {}
+}
+
+function broadcastExcept(id, obj) {
+  clients.forEach((client, cid) => {
+    if (cid !== id) send(client, obj);
+  });
+}
 
 wss.on('connection', (ws) => {
+  let authed = false;
   let myId = null;
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
     let data;
-    try{ data = JSON.parse(raw); }catch(e){ return; }
+    try { data = JSON.parse(raw); } catch (e) { return; }
 
-    if(data.type === 'join'){
-      if(myId) return; // already joined
-      if(clients.size >= MAX_PEERS){
-        send(ws, { type: 'room-full' });
+    if (!authed) {
+      if (data.type !== 'join') return;
+      if (data.password !== PASSWORD) {
+        send(ws, { type: 'auth-error' });
+        ws.close();
         return;
       }
-      const label = pickLabel();
-      if(!label){
-        send(ws, { type: 'room-full' });
-        return;
-      }
-      myId = randomId();
-      clients.set(myId, { ws, label });
+      authed = true;
+      myId = String(nextId++);
+      clients.set(myId, ws);
 
-      const peers = [...clients.entries()]
-        .filter(([id]) => id !== myId)
-        .map(([id, c]) => ({ id, label: c.label }));
-
-      send(ws, { type: 'welcome', id: myId, label, peers });
-      broadcast({ type: 'peer-joined', id: myId, label }, myId);
-      console.log(`[join] ${myId} (${label}) — ${clients.size} online`);
+      const peers = [];
+      clients.forEach((c, cid) => { if (cid !== myId) peers.push({ id: cid }); });
+      send(ws, { type: 'welcome', id: myId, peers });
+      broadcastExcept(myId, { type: 'peer-joined', id: myId });
       return;
     }
 
-    if(data.type === 'signal'){
-      if(!myId) return;
+    if (data.type === 'signal' && data.to) {
       const target = clients.get(data.to);
-      if(!target) return;
-      send(target.ws, {
-        type: 'signal',
-        from: myId,
-        kind: data.kind,
-        payload: data.payload
-      });
+      if (target) send(target, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
       return;
     }
   });
 
-  ws.on('close', () => { if(myId) removeClient(myId); });
-  ws.on('error', () => { if(myId) removeClient(myId); });
+  ws.on('close', () => {
+    if (myId && clients.has(myId)) {
+      clients.delete(myId);
+      broadcastExcept(myId, { type: 'peer-left', id: myId });
+    }
+  });
+
+  ws.on('error', () => {});
 });
 
-// heartbeat: drop dead sockets (helps on hosts that idle-timeout connections)
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if(ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_MS);
-
-wss.on('close', () => clearInterval(heartbeat));
-
 server.listen(PORT, () => {
-  console.log(`talkie-talkie signaling server listening on :${PORT}`);
+  console.log('Talkie signaling server listening on', PORT);
 });
