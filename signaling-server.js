@@ -1,25 +1,48 @@
 // Talkie signaling server
 // Implements exactly the protocol documented in the client:
-//   C->S  {type:'join', room:'lobby', password:<string>}
-//   S->C  {type:'welcome', id, peers:[{id}, ...]}   -- only if password is correct
-//   S->C  {type:'auth-error'}                        -- if password is wrong, then closes
-//   S->C  {type:'peer-joined', id}
-//   S->C  {type:'peer-left', id}
+//   C->S  {type:'join', password:<string>}
+//   S->C  {type:'welcome', id}                        -- only if password is correct
+//   S->C  {type:'auth-error'}                          -- if password is wrong, then closes
+//   C->S  {type:'enter-channel', channel:<id>}
+//   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}  -- peers already in that channel
+//   S->C  {type:'channel-full', channel}
+//   C->S  {type:'leave-channel'}
+//   S->C  {type:'peer-joined', channel, id}            -- only to others already in that same channel
+//   S->C  {type:'peer-left', channel, id}              -- only to others in that same channel
 //   C->S  {type:'signal', to:<peerId>, kind:'offer'|'answer'|'ice', payload}
 //   S->C  {type:'signal', from:<peerId>, kind:'offer'|'answer'|'ice', payload}
+//   C->S  {type:'set-channel-info', channel, desc, cap}
+//   S->C  {type:'stats', total, channels:{<id>:{count,desc,cap}, ...}}
 //
-// The password is checked here, server-side, so no client can ever bypass it
-// by editing/inspecting the page. Prefer setting it via the TALKIE_PASSWORD
-// environment variable in your host's dashboard (e.g. Render > Environment)
-// rather than relying on the fallback below — if this file lives in a public
-// GitHub repo, a hardcoded password here is just as exposed as it was in the
-// old client-side check.
+// This server deliberately knows almost nothing about a channel's contents:
+// it only relays WebRTC signaling (offer/answer/ICE) between clients that
+// are BOTH currently members of the same channel, and it never relays or
+// notifies across channels — each channel is a fully isolated P2P mesh, so
+// one channel's load never grows with the whole app's user count.
+//
+// The one thing this server DOES track authoritatively is the small set of
+// numbers the channel-select screen needs before a client has joined any
+// mesh at all: each channel's description, its capacity, its current
+// member count, and the system-wide total of connected clients. That's
+// pushed to every authenticated client (in or out of a channel) any time it
+// changes, as {type:'stats'}. Everything else about a channel — chat text,
+// files, nicknames, the talkie-talkie radio — is exchanged purely peer-to-
+// peer inside that channel's mesh and never touches this server.
+//
+// The password is checked here, server-side, so no client can ever bypass
+// it by editing/inspecting the page. Prefer setting it via the
+// TALKIE_PASSWORD environment variable in your host's dashboard (e.g.
+// Render > Environment) rather than relying on the fallback below — if this
+// file lives in a public GitHub repo, a hardcoded password here is just as
+// exposed as it was in the old client-side check.
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const PORT = process.env.PORT || 10000;
+const DEFAULT_CHANNEL_CAP = 10;
+const MAX_CHANNEL_CAP = 100;
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -29,16 +52,50 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 let nextId = 1;
-const clients = new Map(); // id -> ws
+const clients = new Map();     // id -> {ws, channel: string|null}
+const channelMeta = new Map(); // channelId -> {desc: string|null, cap: number}
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
 
-function broadcastExcept(id, obj) {
-  clients.forEach((client, cid) => {
-    if (cid !== id) send(client, obj);
+function getChannelMeta(ch) {
+  if (!channelMeta.has(ch)) channelMeta.set(ch, { desc: null, cap: DEFAULT_CHANNEL_CAP });
+  return channelMeta.get(ch);
+}
+
+function channelMemberIds(ch) {
+  const ids = [];
+  clients.forEach((c, id) => { if (c.channel === ch) ids.push(id); });
+  return ids;
+}
+
+function broadcastToChannelExcept(ch, exceptId, obj) {
+  const msg = JSON.stringify(obj);
+  clients.forEach((c, id) => {
+    if (id !== exceptId && c.channel === ch) { try { c.ws.send(msg); } catch (e) {} }
   });
+}
+
+function broadcastStats() {
+  const channelsOut = {};
+  channelMeta.forEach((meta, ch) => {
+    channelsOut[ch] = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
+  });
+  const msg = JSON.stringify({ type: 'stats', total: clients.size, channels: channelsOut });
+  clients.forEach((c) => { try { c.ws.send(msg); } catch (e) {} });
+}
+
+// Removes a client from whatever channel it's in (if any) and tells the
+// other members of that channel it's gone. Does not touch the socket and
+// does not broadcast stats itself — callers do that once, after any other
+// state changes they're making in the same operation.
+function leaveChannel(id) {
+  const c = clients.get(id);
+  if (!c || !c.channel) return;
+  const ch = c.channel;
+  c.channel = null;
+  broadcastToChannelExcept(ch, id, { type: 'peer-left', channel: ch, id });
 }
 
 wss.on('connection', (ws) => {
@@ -58,18 +115,66 @@ wss.on('connection', (ws) => {
       }
       authed = true;
       myId = String(nextId++);
-      clients.set(myId, ws);
+      clients.set(myId, { ws, channel: null });
+      send(ws, { type: 'welcome', id: myId });
+      broadcastStats();
+      return;
+    }
 
-      const peers = [];
-      clients.forEach((c, cid) => { if (cid !== myId) peers.push({ id: cid }); });
-      send(ws, { type: 'welcome', id: myId, peers });
-      broadcastExcept(myId, { type: 'peer-joined', id: myId });
+    const me = clients.get(myId);
+    if (!me) return;
+
+    if (data.type === 'enter-channel' && typeof data.channel === 'string' && data.channel) {
+      const ch = data.channel;
+      if (me.channel === ch) {
+        // Already in it (e.g. a resend after a brief reconnect) — just
+        // re-send the current member list, nothing else changes.
+        const peers = channelMemberIds(ch).filter((id) => id !== myId).map((id) => ({ id }));
+        send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
+        return;
+      }
+      const meta = getChannelMeta(ch);
+      const existing = channelMemberIds(ch);
+      if (existing.length >= meta.cap) {
+        send(ws, { type: 'channel-full', channel: ch });
+        return;
+      }
+      if (me.channel) leaveChannel(myId);
+      me.channel = ch;
+      const peers = existing.map((id) => ({ id }));
+      send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
+      broadcastToChannelExcept(ch, myId, { type: 'peer-joined', channel: ch, id: myId });
+      broadcastStats();
+      return;
+    }
+
+    if (data.type === 'leave-channel') {
+      if (me.channel) { leaveChannel(myId); broadcastStats(); }
+      return;
+    }
+
+    if (data.type === 'set-channel-info' && typeof data.channel === 'string') {
+      // Only the channel you're currently in can have its description/cap
+      // changed, and only by someone actually inside it.
+      if (me.channel !== data.channel) return;
+      const meta = getChannelMeta(data.channel);
+      if (typeof data.desc !== 'undefined') {
+        meta.desc = (typeof data.desc === 'string' && data.desc) ? data.desc.slice(0, 10) : null;
+      }
+      if (typeof data.cap === 'number' && !isNaN(data.cap)) {
+        meta.cap = Math.max(DEFAULT_CHANNEL_CAP, Math.min(MAX_CHANNEL_CAP, Math.round(data.cap)));
+      }
+      broadcastStats();
       return;
     }
 
     if (data.type === 'signal' && data.to) {
       const target = clients.get(data.to);
-      if (target) send(target, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
+      // Only relay within the same channel room — this is what makes the
+      // isolation actually enforced server-side, not just client etiquette.
+      if (target && me.channel && target.channel === me.channel) {
+        send(target.ws, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
+      }
       return;
     }
 
@@ -84,8 +189,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (myId && clients.has(myId)) {
+      const me = clients.get(myId);
+      if (me.channel) leaveChannel(myId);
       clients.delete(myId);
-      broadcastExcept(myId, { type: 'peer-left', id: myId });
+      broadcastStats();
     }
   });
 
