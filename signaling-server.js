@@ -72,6 +72,14 @@ wss.on('connection', (ws) => {
       if (target) send(target, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
       return;
     }
+
+    if (data.type === 'ping') {
+      // App-level heartbeat: keeps traffic flowing so idle-timeout proxies
+      // (Render, etc.) don't kill the socket, and lets the client confirm
+      // the connection is actually alive (not just "not yet closed").
+      send(ws, { type: 'pong' });
+      return;
+    }
   });
 
   ws.on('close', () => {
