@@ -42,7 +42,17 @@ const { WebSocketServer } = require('ws');
 const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const PORT = process.env.PORT || 10000;
 const DEFAULT_CHANNEL_CAP = 10;
-const MAX_CHANNEL_CAP = 100;
+const MIN_CHANNEL_CAP = 1;
+const MAX_CHANNEL_CAP = 15;
+// A '변동채널' (frequency-matched channel) is just a channel whose id the
+// client derives from a 6-digit frequency instead of a fixed CH01~CH10 id
+// (see talkie.html). No protocol change was needed for that — any string
+// is a valid channel id here already — but those channels should NOT
+// persist once empty (unlike the fixed channels, which always exist).
+// The client always prefixes such ids with FREQ_CHANNEL_PREFIX so we can
+// tell them apart and clean them up.
+const FREQ_CHANNEL_PREFIX = 'FQ_';
+function isFreqChannel(ch) { return typeof ch === 'string' && ch.indexOf(FREQ_CHANNEL_PREFIX) === 0; }
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -96,6 +106,12 @@ function leaveChannel(id) {
   const ch = c.channel;
   c.channel = null;
   broadcastToChannelExcept(ch, id, { type: 'peer-left', channel: ch, id });
+  // 변동채널: once the last member leaves, the room ceases to exist — drop
+  // its meta entirely so it doesn't linger in memory or in future stats
+  // broadcasts. Fixed channels (CH01~CH10) are left alone, on purpose.
+  if (isFreqChannel(ch) && channelMemberIds(ch).length === 0) {
+    channelMeta.delete(ch);
+  }
 }
 
 wss.on('connection', (ws) => {
@@ -162,7 +178,7 @@ wss.on('connection', (ws) => {
         meta.desc = (typeof data.desc === 'string' && data.desc) ? data.desc.slice(0, 10) : null;
       }
       if (typeof data.cap === 'number' && !isNaN(data.cap)) {
-        meta.cap = Math.max(DEFAULT_CHANNEL_CAP, Math.min(MAX_CHANNEL_CAP, Math.round(data.cap)));
+        meta.cap = Math.max(MIN_CHANNEL_CAP, Math.min(MAX_CHANNEL_CAP, Math.round(data.cap)));
       }
       broadcastStats();
       return;
