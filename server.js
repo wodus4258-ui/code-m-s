@@ -148,15 +148,6 @@ wss.on('connection', (ws) => {
       let role = null;
       if (data.password === PASSWORD) role = 'user';
       else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) role = 'operator';
-      // TEMP DEBUG — remove after confirming the mismatch. Does not print
-      // the actual password values, only their lengths, so it's safe to
-      // leave visible in Render's log viewer while you diagnose this.
-      console.log('[join attempt]',
-        'received length:', data.password ? data.password.length : 0,
-        'PASSWORD length:', PASSWORD.length,
-        'OPERATOR_PASSWORD set?', !!OPERATOR_PASSWORD,
-        'OPERATOR_PASSWORD length:', OPERATOR_PASSWORD ? OPERATOR_PASSWORD.length : 0,
-        'matched role:', role);
       if (!role) {
         send(ws, { type: 'auth-error' });
         ws.close();
