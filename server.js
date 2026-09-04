@@ -55,6 +55,15 @@ const { WebSocketServer } = require('ws');
 const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const OPERATOR_PASSWORD = process.env.TALKIE_OPERATOR_PASSWORD || '051627*';
 const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
+// Key required to manage the announcement banner and read the admin status
+// endpoint (talkie-ad.html). This is a separate, server-verified secret —
+// unrelated to the "4258" screen-lock PIN typed into talkie-ad.html itself,
+// which is only a client-side gate on that page's UI. Set this via Render's
+// Environment tab like the passwords above.
+//   TALKIE_ADMIN_KEY         required by talkie-ad.html to read/write the
+//                             notice banner and to view live connection
+//                             stats. Keep it out of source control.
+const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
 // The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
 // literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
 const OPERATOR_CHANNEL_ID = 'CH10';
@@ -71,8 +80,111 @@ const MAX_CHANNEL_CAP = 15;
 // tell them apart and clean them up.
 const FREQ_CHANNEL_PREFIX = 'FQ_';
 function isFreqChannel(ch) { return typeof ch === 'string' && ch.indexOf(FREQ_CHANNEL_PREFIX) === 0; }
+// Used only to pre-list all ten fixed channels in the /status admin
+// endpoint (with a 0 count) even before anyone has ever entered one —
+// channelMeta itself is only populated lazily, on first entry.
+const FIXED_CHANNEL_IDS = ['CH01','CH02','CH03','CH04','CH05','CH06','CH07','CH08','CH09','CH10'];
+
+// Two independent server-wide announcements, kept in memory only (reset on
+// server restart), one per banner: 'pw' drives the banner under the
+// password screen, 'ch' drives the banner on the channel-select screen.
+// They're published/edited separately from talkie-ad.html and pushed to
+// clients together (see noticePayload) so each client-side banner just
+// reads the slot it cares about.
+let notices = {
+  pw: { text: '', imageUrl: '', updatedAt: 0 },
+  ch: { text: '', imageUrl: '', updatedAt: 0 },
+};
+const NOTICE_TARGETS = ['pw', 'ch'];
+
+function readBody(req, cb) {
+  let body = '';
+  let tooBig = false;
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 3 * 1024 * 1024) { tooBig = true; req.destroy(); }
+  });
+  req.on('end', () => { if (!tooBig) cb(body); });
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function noticePayload() {
+  return { type: 'notice', pw: notices.pw, ch: notices.ch };
+}
 
 const server = http.createServer((req, res) => {
+  const path = (req.url || '').split('?')[0];
+
+  // CORS preflight for talkie-ad.html, which may be opened from a
+  // different origin (a local file, or a separate static host) than this
+  // signaling server.
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    res.end();
+    return;
+  }
+
+  // Public: anyone (including a client still sitting on the password
+  // screen, before it has authenticated over the websocket at all) can
+  // read the current notices. Returns both slots at once — this is what
+  // lets the password-screen banner and the channel-select banner each
+  // show their own text/image before (and independent of) login.
+  if (path === '/notice' && req.method === 'GET') {
+    sendJson(res, 200, { pw: notices.pw, ch: notices.ch });
+    return;
+  }
+
+  // Admin-only: publish/replace one of the two notice slots. Requires
+  // TALKIE_ADMIN_KEY plus a target of 'pw' (password screen) or 'ch'
+  // (channel-select screen) — the two are edited independently, so this
+  // never touches the other slot.
+  if (path === '/notice' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const target = NOTICE_TARGETS.indexOf(data.target) !== -1 ? data.target : null;
+      if (!target) { sendJson(res, 400, { error: 'invalid target' }); return; }
+      notices[target] = {
+        text: typeof data.text === 'string' ? data.text.slice(0, 500) : '',
+        imageUrl: typeof data.imageUrl === 'string' ? data.imageUrl.slice(0, 4000) : '',
+        updatedAt: Date.now(),
+      };
+      broadcastNotice();
+      sendJson(res, 200, { ok: true, target, notice: notices[target], notices });
+    });
+    return;
+  }
+
+  // Admin-only: live connection status (total + per-channel counts,
+  // including 변동채널 with their raw FQ_-prefixed ids) for talkie-ad.html's
+  // second panel. Requires TALKIE_ADMIN_KEY as a query param.
+  if (path === '/status' && req.method === 'GET') {
+    let key = null;
+    try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
+    if (!ADMIN_KEY || key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+    const channelsOut = {};
+    FIXED_CHANNEL_IDS.forEach((ch) => { channelsOut[ch] = { desc: null, cap: DEFAULT_CHANNEL_CAP, count: 0 }; });
+    channelMeta.forEach((meta, ch) => {
+      channelsOut[ch] = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
+    });
+    sendJson(res, 200, { total: clients.size, channels: channelsOut });
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Talkie signaling server OK');
 });
@@ -82,6 +194,10 @@ const wss = new WebSocketServer({ server });
 let nextId = 1;
 const clients = new Map();     // id -> {ws, channel: string|null}
 const channelMeta = new Map(); // channelId -> {desc: string|null, cap: number}
+// Every currently-open websocket, authenticated or not — used only to push
+// {type:'notice'} updates immediately to everyone, including someone who's
+// still sitting on the password screen (see wss.on('connection') below).
+const rawSockets = new Set();
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
@@ -103,6 +219,11 @@ function broadcastToChannelExcept(ch, exceptId, obj) {
   clients.forEach((c, id) => {
     if (id !== exceptId && c.channel === ch) { try { c.ws.send(msg); } catch (e) {} }
   });
+}
+
+function broadcastNotice() {
+  const msg = JSON.stringify(noticePayload());
+  rawSockets.forEach((s) => { try { s.send(msg); } catch (e) {} });
 }
 
 function broadcastStats() {
@@ -135,6 +256,12 @@ function leaveChannel(id) {
 wss.on('connection', (ws) => {
   let authed = false;
   let myId = null;
+
+  // Track this socket for notice broadcasts and push the current notice
+  // right away — this works even before 'join', so the password screen's
+  // banner has something to show as soon as the app opens a socket.
+  rawSockets.add(ws);
+  send(ws, noticePayload());
 
   ws.on('message', (raw) => {
     let data;
@@ -238,6 +365,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    rawSockets.delete(ws);
     if (myId && clients.has(myId)) {
       const me = clients.get(myId);
       if (me.channel) leaveChannel(myId);
