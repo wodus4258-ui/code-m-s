@@ -110,6 +110,24 @@ const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
 //                                           event log (login/logout/
 //                                           channel-enter/kick) for
 //                                           talkie-ad.html's [LOG] view.
+//   POST /auto-kick    { key, kind, country?, region?, ip?, device?, label? }
+//                                        -- admin-only: add an AUTO KICK
+//                                           rule (kind: 'country'|'region'|
+//                                           'ip'|'specific'); kicks any
+//                                           currently-connected match right
+//                                           away and blocks that condition
+//                                           from joining from then on.
+//   GET  /auto-kick-list ?key=...        -- admin-only: list active AUTO
+//                                           KICK rules (for [AUTO KICK 해제]).
+//   POST /auto-kick-remove { key, id }   -- admin-only: remove one AUTO KICK
+//                                           rule by id.
+//   POST /kick-channel { key, channel }  -- admin-only: KICK everyone
+//                                           currently in one channel.
+//   POST /auto-kick-channel { key, channel }
+//                                        -- admin-only: AUTO KICK everyone
+//                                           currently in one channel, each
+//                                           by their own 'specific' (country+
+//                                           region+ip+device) condition.
 // The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
 // literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
 const OPERATOR_CHANNEL_ID = 'CH10';
@@ -163,6 +181,43 @@ let serverLocked = false;
 // just because geoip-lite failed to resolve an IP.
 let countryBlockActive = false;
 const COUNTRY_BLOCK_ALLOW = 'KR';
+
+// AUTO KICK 규칙. 관리자가 talkie-ad.html의 [AUTO KICK] 팝업(국가/지역/IP/
+// 특정) 또는 채널 팝업의 [채널 AUTO KICK]에서 만든, "이 조건에 맞으면 이후
+// 접속도 계속 차단한다"는 규칙 목록. In-memory only, like everything else
+// here — resets on restart.
+//   kind:'country'  — country 코드가 일치하면 차단
+//   kind:'region'   — country + region이 모두 일치해야 차단 (region 코드는
+//                      국가마다 겹칠 수 있어 country를 함께 본다)
+//   kind:'ip'       — ip가 정확히 일치하면 차단
+//   kind:'specific' — country + region + ip + device가 전부 일치하는
+//                      "교집합"일 때만 차단 (가장 좁은 범위, 팝업의 [특정])
+// 규칙은 join 시점에 이미 계산해둔 geoip/UA 값과 대조해 로그인 자체를 막고,
+// 새 규칙이 추가되는 순간에는 이미 접속 중인 클라이언트 중 일치하는 사람도
+// 즉시 KICK한다(kickClientsMatchingRule).
+const autoKickRules = [];
+let nextRuleId = 1;
+
+function ruleMatchesCandidate(rule, cand) {
+  switch (rule.kind) {
+    case 'country':
+      return !!rule.country && rule.country !== '-' && cand.country === rule.country;
+    case 'region':
+      return !!rule.country && rule.country !== '-' && !!rule.region && rule.region !== '-' &&
+        cand.country === rule.country && cand.region === rule.region;
+    case 'ip':
+      return !!rule.ip && cand.ip === rule.ip;
+    case 'specific':
+      return !!rule.ip && cand.ip === rule.ip &&
+        cand.country === rule.country && cand.region === rule.region && cand.device === rule.device;
+    default:
+      return false;
+  }
+}
+
+function isAutoKickBlocked(cand) {
+  return autoKickRules.some((r) => ruleMatchesCandidate(r, cand));
+}
 
 // Rolling event log for talkie-ad.html's [LOG] view — login / logout /
 // channel-enter / kick, each with a snapshot of who/where/what-device at
@@ -379,6 +434,93 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Admin-only: "AUTO KICK" 규칙 추가. kind별로 필요한 필드가 다르다(위
+  // autoKickRules 선언부 주석 참고). 규칙을 추가하는 즉시 현재 접속 중인
+  // 클라이언트 중 일치하는 사람도 함께 KICK한다.
+  if (path === '/auto-kick' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const kind = ['country', 'region', 'ip', 'specific'].indexOf(data.kind) !== -1 ? data.kind : null;
+      if (!kind) { sendJson(res, 400, { error: 'invalid kind' }); return; }
+      const rule = {
+        id: String(nextRuleId++),
+        kind,
+        country: (typeof data.country === 'string' && data.country) ? data.country.slice(0, 8) : null,
+        region: (typeof data.region === 'string' && data.region) ? data.region.slice(0, 40) : null,
+        ip: (typeof data.ip === 'string' && data.ip) ? data.ip.slice(0, 64) : null,
+        device: (typeof data.device === 'string' && data.device) ? data.device.slice(0, 60) : null,
+        label: typeof data.label === 'string' ? data.label.slice(0, 80) : null,
+        createdAt: Date.now(),
+      };
+      if (kind === 'country' && (!rule.country || rule.country === '-')) { sendJson(res, 400, { error: 'country required' }); return; }
+      if (kind === 'region' && (!rule.country || rule.country === '-' || !rule.region || rule.region === '-')) { sendJson(res, 400, { error: 'country/region required' }); return; }
+      if ((kind === 'ip' || kind === 'specific') && !rule.ip) { sendJson(res, 400, { error: 'ip required' }); return; }
+      autoKickRules.push(rule);
+      logEvent('auto-kick-add', null, null, { rule });
+      kickClientsMatchingRule(rule);
+      sendJson(res, 200, { ok: true, rule });
+    });
+    return;
+  }
+
+  // Admin-only: 현재 활성화된 AUTO KICK 규칙 목록 — talkie-ad.html의
+  // [AUTO KICK 해제] 팝업이 사용한다.
+  if (path === '/auto-kick-list' && req.method === 'GET') {
+    let key = null;
+    try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
+    if (!ADMIN_KEY || key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+    sendJson(res, 200, { rules: autoKickRules });
+    return;
+  }
+
+  // Admin-only: AUTO KICK 규칙 해제(삭제). 이미 KICK된 세션을 되돌리지는
+  // 않는다 — 해제 이후의 접속부터 다시 허용될 뿐이다.
+  if (path === '/auto-kick-remove' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const idx = autoKickRules.findIndex((r) => r.id === String(data.id));
+      if (idx === -1) { sendJson(res, 404, { error: 'not found' }); return; }
+      const removed = autoKickRules.splice(idx, 1)[0];
+      logEvent('auto-kick-remove', null, null, { rule: removed });
+      sendJson(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // Admin-only: "채널 KICK" — 지정한 채널에 현재 참여 중인 전원을 KICK한다
+  // (AUTO KICK 규칙은 만들지 않으므로 재접속/재입장은 그대로 가능).
+  if (path === '/kick-channel' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const ch = (typeof data.channel === 'string' && data.channel) ? data.channel : null;
+      if (!ch) { sendJson(res, 400, { error: 'invalid channel' }); return; }
+      const count = kickChannelClients(ch);
+      sendJson(res, 200, { ok: true, count });
+    });
+    return;
+  }
+
+  // Admin-only: "채널 AUTO KICK" — 지정한 채널에 현재 참여 중인 전원을 각자
+  // 본인 조건("특정")으로 AUTO KICK한다.
+  if (path === '/auto-kick-channel' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const ch = (typeof data.channel === 'string' && data.channel) ? data.channel : null;
+      if (!ch) { sendJson(res, 400, { error: 'invalid channel' }); return; }
+      const rules = autoKickChannelClients(ch);
+      sendJson(res, 200, { ok: true, rules });
+    });
+    return;
+  }
+
   // Public: lets a client still sitting on the password screen (before it
   // has ever sent 'join' over the websocket) know whether the server is
   // currently under ALL KILL lockdown, so it can hide the password box and
@@ -534,6 +676,71 @@ function kickNonKoreaClients() {
   }, 150);
 }
 
+// AUTO KICK 규칙에 걸리는, 현재 접속 중인 클라이언트를 즉시 KICK. 규칙이
+// 새로 추가된 직후 한 번 호출해 "이미 들어와 있던 사람"도 놓치지 않는다.
+function kickClientsMatchingRule(rule) {
+  const sockets = [];
+  clients.forEach((c, id) => {
+    if (ruleMatchesCandidate(rule, c)) {
+      c.wasKicked = true;
+      logEvent('kick', id, c, { reason: 'auto-kick', ruleId: rule.id, ruleKind: rule.kind });
+      send(c.ws, { type: 'kicked' });
+      sockets.push(c.ws);
+    }
+  });
+  setTimeout(() => { sockets.forEach((ws) => { try { ws.close(); } catch (e) {} }); }, 150);
+}
+
+// "채널 KICK": 특정 채널에 현재 참여 중인 전원을 KICK한다. AUTO KICK 규칙은
+// 만들지 않으므로 재접속/재입장은 그대로 가능하다.
+function kickChannelClients(ch) {
+  const sockets = [];
+  clients.forEach((c, id) => {
+    if (c.channel === ch) {
+      c.wasKicked = true;
+      logEvent('kick', id, c, { reason: 'channel-kick', channel: ch });
+      send(c.ws, { type: 'kicked' });
+      sockets.push(c.ws);
+    }
+  });
+  setTimeout(() => { sockets.forEach((ws) => { try { ws.close(); } catch (e) {} }); }, 150);
+  return sockets.length;
+}
+
+// "채널 AUTO KICK": 특정 채널에 현재 참여 중인 전원을, 각자 본인의
+// country+region+ip+device 교집합("특정" 조건)으로 AUTO KICK 규칙을 만들면서
+// KICK한다. 채널 전체를 국가/지역/IP 단위로 뭉뚱그려 막으면 그 채널과 무관한
+// 다른 사용자까지 함께 막힐 수 있으므로, 일부러 가장 좁은 "특정" 조건만
+// 사용한다.
+function autoKickChannelClients(ch) {
+  const addedRules = [];
+  const sockets = [];
+  clients.forEach((c, id) => {
+    if (c.channel !== ch) return;
+    if (c.ip) {
+      const rule = {
+        id: String(nextRuleId++),
+        kind: 'specific',
+        country: c.country || null,
+        region: c.region || null,
+        ip: c.ip,
+        device: c.device || null,
+        label: '채널 AUTO KICK (' + ch + ')',
+        createdAt: Date.now(),
+      };
+      autoKickRules.push(rule);
+      addedRules.push(rule);
+      logEvent('auto-kick-add', id, c, { rule, channel: ch });
+    }
+    c.wasKicked = true;
+    logEvent('kick', id, c, { reason: 'channel-auto-kick', channel: ch });
+    send(c.ws, { type: 'kicked' });
+    sockets.push(c.ws);
+  });
+  setTimeout(() => { sockets.forEach((ws) => { try { ws.close(); } catch (e) {} }); }, 150);
+  return addedRules;
+}
+
 // Removes a client from whatever channel it's in (if any) and tells the
 // other members of that channel it's gone. Does not touch the socket and
 // does not broadcast stats itself — callers do that once, after any other
@@ -587,6 +794,14 @@ wss.on('connection', (ws, req) => {
       // 클라이언트(talkie.html) 쪽 변경 없이도 곧바로 "접속중지" 화면이
       // 뜨도록 한다.
       if (countryBlockActive && geo.country && geo.country !== '-' && geo.country !== COUNTRY_BLOCK_ALLOW) {
+        send(ws, { type: 'server-locked' });
+        ws.close();
+        return;
+      }
+      // AUTO KICK 규칙에 걸리는 접속도 국경 봉쇄와 동일하게 처리 —
+      // 클라이언트(talkie.html) 쪽 변경 없이도 곧바로 "접속중지" 화면이
+      // 뜨도록 {type:'server-locked'}를 그대로 재사용한다.
+      if (isAutoKickBlocked({ country: geo.country, region: geo.region, ip, device })) {
         send(ws, { type: 'server-locked' });
         ws.close();
         return;
