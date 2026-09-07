@@ -57,9 +57,18 @@
 //                             both passwords above — entering CH10 has
 //                             nothing to do with which password was used to
 //                             join in the first place.
+//
+// Country/region/city in the admin panel come from the bundled geoip-lite
+// package (offline IP database, no per-request network calls) — run
+// `npm install` after pulling this change so that dependency is present.
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
+// Offline IP->country/region/city lookup (bundled database, no network
+// calls per-request). Wrapped in try/catch so a missing `npm install`
+// degrades to '-' fields instead of crashing the whole server.
+let geoip = null;
+try { geoip = require('geoip-lite'); } catch (e) { geoip = null; }
 
 const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const OPERATOR_PASSWORD = process.env.TALKIE_OPERATOR_PASSWORD || '051627*';
@@ -97,6 +106,10 @@ const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
 //                                           "접속중지" instead of letting
 //                                           someone type a password that would
 //                                           just be refused.
+//   GET  /log         ?key=...           -- admin-only: the full rolling
+//                                           event log (login/logout/
+//                                           channel-enter/kick) for
+//                                           talkie-ad.html's [LOG] view.
 // The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
 // literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
 const OPERATOR_CHANNEL_ID = 'CH10';
@@ -139,6 +152,29 @@ const NOTICE_TARGETS = ['pw', 'ch'];
 // unlocked on server restart. While true, no 'join' (from anyone, correct
 // password or not) succeeds; see the join handler below.
 let serverLocked = false;
+
+// Rolling event log for talkie-ad.html's [LOG] view — login / logout /
+// channel-enter / kick, each with a snapshot of who/where/what-device at
+// that moment. In-memory only, so "언제부터 추적 가능한가" is simply "since
+// this server process last started" (same lifetime as every other piece of
+// state here). Capped so a long-running server doesn't grow this forever.
+const eventLog = [];
+const MAX_LOG_ENTRIES = 5000;
+function logEvent(type, id, c, extra) {
+  const entry = Object.assign({
+    type,
+    id,
+    ts: Date.now(),
+    nickname: c ? (c.nickname || null) : null,
+    ip: c ? (c.ip || null) : null,
+    country: c ? (c.country || null) : null,
+    region: c ? (c.region || null) : null,
+    city: c ? (c.city || null) : null,
+    device: c ? (c.device || null) : null,
+  }, extra || {});
+  eventLog.push(entry);
+  if (eventLog.length > MAX_LOG_ENTRIES) eventLog.splice(0, eventLog.length - MAX_LOG_ENTRIES);
+}
 
 function readBody(req, cb) {
   let body = '';
@@ -237,9 +273,24 @@ const server = http.createServer((req, res) => {
         channel: c.channel,
         connectedAt: c.connectedAt,
         ip: c.ip || null,
+        country: c.country || null,
+        region: c.region || null,
+        city: c.city || null,
+        device: c.device || null,
       });
     });
     sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut, locked: serverLocked });
+    return;
+  }
+
+  // Admin-only: the full rolling event log (login/logout/channel-enter/kick)
+  // for talkie-ad.html's [LOG] view. See eventLog/logEvent above for what's
+  // tracked and since when.
+  if (path === '/log' && req.method === 'GET') {
+    let key = null;
+    try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
+    if (!ADMIN_KEY || key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+    sendJson(res, 200, { log: eventLog });
     return;
   }
 
@@ -255,6 +306,8 @@ const server = http.createServer((req, res) => {
       if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
       const target = clients.get(String(data.id));
       if (!target) { sendJson(res, 404, { error: 'not found' }); return; }
+      target.wasKicked = true;
+      logEvent('kick', String(data.id), target);
       send(target.ws, { type: 'kicked' });
       // Small delay so the 'kicked' frame has a moment to actually reach the
       // client before the socket goes away — the client's own close handler
@@ -341,6 +394,49 @@ function getClientIp(req) {
   return (req.socket && req.socket.remoteAddress) || '';
 }
 
+// Best-effort country/region/city for an IP, using the bundled geoip-lite
+// database (no external requests). Private/local IPs (dev, or a host that
+// doesn't forward a real client IP) simply come back as '-' fields — this
+// is purely informational for the admin panel, never used for any
+// access-control decision.
+function getGeoInfo(ip) {
+  if (!geoip || !ip) return { country: '-', region: '-', city: '-' };
+  let g = null;
+  try { g = geoip.lookup(ip); } catch (e) { g = null; }
+  if (!g) return { country: '-', region: '-', city: '-' };
+  return {
+    country: g.country || '-',
+    region: g.region || '-',
+    city: g.city || '-',
+  };
+}
+
+// Coarse device/browser label parsed from the User-Agent header the browser
+// sends on the websocket upgrade request. This is a self-reported string a
+// client could fake, and modern browsers increasingly freeze/generalize it
+// for privacy — treat it as a rough hint for the admin panel, not a hard
+// device fingerprint.
+function parseDeviceLabel(ua) {
+  if (!ua) return '-';
+  const s = String(ua);
+  let os = 'Unknown';
+  if (/iPad/i.test(s)) os = 'iPad';
+  else if (/iPhone/i.test(s)) os = 'iPhone';
+  else if (/Android/i.test(s)) os = 'Android';
+  else if (/Macintosh|Mac OS X/i.test(s)) os = 'Mac';
+  else if (/Windows/i.test(s)) os = 'Windows';
+  else if (/CrOS/i.test(s)) os = 'ChromeOS';
+  else if (/Linux/i.test(s)) os = 'Linux';
+  let browser = '';
+  if (/EdgA?\//i.test(s)) browser = 'Edge';
+  else if (/CriOS/i.test(s)) browser = 'Chrome';
+  else if (/FxiOS/i.test(s)) browser = 'Firefox';
+  else if (/Firefox\//i.test(s)) browser = 'Firefox';
+  else if (/Chrome\//i.test(s) && !/Chromium/i.test(s)) browser = 'Chrome';
+  else if (/Safari\//i.test(s) && !/Chrome/i.test(s)) browser = 'Safari';
+  return browser ? (os + ' · ' + browser) : os;
+}
+
 function getChannelMeta(ch) {
   if (!channelMeta.has(ch)) channelMeta.set(ch, { desc: null, cap: DEFAULT_CHANNEL_CAP });
   return channelMeta.get(ch);
@@ -381,7 +477,9 @@ function broadcastStats() {
 // callers decide separately whether logins stay open afterward.
 function kickAllClients() {
   const sockets = [];
-  clients.forEach((c) => {
+  clients.forEach((c, id) => {
+    c.wasKicked = true;
+    logEvent('kick', id, c);
     send(c.ws, { type: 'kicked' });
     sockets.push(c.ws);
   });
@@ -412,6 +510,9 @@ wss.on('connection', (ws, req) => {
   let authed = false;
   let myId = null;
   const ip = getClientIp(req);
+  const ua = req.headers['user-agent'] || '';
+  const geo = getGeoInfo(ip);
+  const device = parseDeviceLabel(ua);
 
   // Track this socket for notice broadcasts and push the current notice
   // right away — this works even before 'join', so the password screen's
@@ -447,8 +548,13 @@ wss.on('connection', (ws, req) => {
       }
       authed = true;
       myId = String(nextId++);
-      clients.set(myId, { ws, channel: null, role, ip, connectedAt: Date.now(), nickname: null });
+      clients.set(myId, {
+        ws, channel: null, role, ip, connectedAt: Date.now(), nickname: null,
+        country: geo.country, region: geo.region, city: geo.city, device,
+        wasKicked: false,
+      });
       send(ws, { type: 'welcome', id: myId, role });
+      logEvent('login', myId, clients.get(myId));
       broadcastStats();
       return;
     }
@@ -494,6 +600,7 @@ wss.on('connection', (ws, req) => {
       const peers = existing.map((id) => ({ id }));
       send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
       broadcastToChannelExcept(ch, myId, { type: 'peer-joined', channel: ch, id: myId });
+      logEvent('channel-enter', myId, me, { channel: ch });
       broadcastStats();
       return;
     }
@@ -542,6 +649,11 @@ wss.on('connection', (ws, req) => {
     rawSockets.delete(ws);
     if (myId && clients.has(myId)) {
       const me = clients.get(myId);
+      // Don't double-log: a kick already recorded its own 'kick' entry
+      // (and the client never gets a chance to reconnect/logout normally
+      // in that same session), so a plain 'logout' entry here would just
+      // be noise on top of it.
+      if (!me.wasKicked) logEvent('logout', myId, me);
       if (me.channel) leaveChannel(myId);
       clients.delete(myId);
       broadcastStats();
