@@ -60,12 +60,7 @@ const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
 const OPERATOR_CHANNEL_ID = 'CH10';
 const PORT = process.env.PORT || 10000;
 const DEFAULT_CHANNEL_CAP = 10;
-// Fixed channels (CH01~CH10) and 변동채널(frequency channels) allow different
-// minimum caps — fixed channels are meant to stay reasonably large (10~15),
-// while a 변동채널 can be as small as a 1:1 conversation plus one more (2~15).
-// Both share the same upper bound.
-const MIN_FIXED_CHANNEL_CAP = 10;
-const MIN_FREQ_CHANNEL_CAP = 2;
+const MIN_CHANNEL_CAP = 1;
 const MAX_CHANNEL_CAP = 15;
 // A '변동채널' (frequency-matched channel) is just a channel whose id the
 // client derives from a 6-digit frequency instead of a fixed CH01~CH10 id
@@ -217,8 +212,7 @@ wss.on('connection', (ws) => {
         meta.desc = (typeof data.desc === 'string' && data.desc) ? data.desc.slice(0, 10) : null;
       }
       if (typeof data.cap === 'number' && !isNaN(data.cap)) {
-        const minCap = isFreqChannel(data.channel) ? MIN_FREQ_CHANNEL_CAP : MIN_FIXED_CHANNEL_CAP;
-        meta.cap = Math.max(minCap, Math.min(MAX_CHANNEL_CAP, Math.round(data.cap)));
+        meta.cap = Math.max(MIN_CHANNEL_CAP, Math.min(MAX_CHANNEL_CAP, Math.round(data.cap)));
       }
       broadcastStats();
       return;
