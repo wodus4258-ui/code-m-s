@@ -3,6 +3,7 @@
 //   C->S  {type:'join', password:<string>}
 //   S->C  {type:'welcome', id, role:'user'|'operator'} -- only if password is correct
 //   S->C  {type:'auth-error'}                          -- if password is wrong, then closes
+//   C->S  {type:'set-nickname', nickname:<string>}     -- informational only, for admin panel
 //   C->S  {type:'enter-channel', channel:<id>, ch10Password?:<string>}
 //   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}  -- peers already in that channel
 //   S->C  {type:'channel-full', channel}
@@ -14,6 +15,8 @@
 //   S->C  {type:'signal', from:<peerId>, kind:'offer'|'answer'|'ice', payload}
 //   C->S  {type:'set-channel-info', channel, desc, cap}
 //   S->C  {type:'stats', total, channels:{<id>:{count,desc,cap}, ...}}
+//   S->C  {type:'kicked'}                              -- admin forced this client off; client
+//                                                          must drop straight to the password screen
 //
 // This server deliberately knows almost nothing about a channel's contents:
 // it only relays WebRTC signaling (offer/answer/ICE) between clients that
@@ -27,8 +30,11 @@
 // member count, and the system-wide total of connected clients. That's
 // pushed to every authenticated client (in or out of a channel) any time it
 // changes, as {type:'stats'}. Everything else about a channel — chat text,
-// files, nicknames, the talkie-talkie radio — is exchanged purely peer-to-
-// peer inside that channel's mesh and never touches this server.
+// files, the talkie-talkie radio — is exchanged purely peer-to-peer inside
+// that channel's mesh and never touches this server. The one exception is
+// the nickname: the client also reports it here (via 'set-nickname'), purely
+// so the admin panel (talkie-ad.html) can show who's connected — it is
+// never used for any access-control decision server-side.
 //
 // All three passwords below are checked here, server-side, so no client can
 // ever bypass them by editing/inspecting the page. Prefer setting all of
@@ -61,8 +67,10 @@ const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
 // which is only a client-side gate on that page's UI. Set this via Render's
 // Environment tab like the passwords above.
 //   TALKIE_ADMIN_KEY         required by talkie-ad.html to read/write the
-//                             notice banner and to view live connection
-//                             stats. Keep it out of source control.
+//                             notice banner, view live connection stats
+//                             (including each client's nickname/IP/channel),
+//                             and to forcibly disconnect ("KICK") a client.
+//                             Keep it out of source control.
 const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
 // The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
 // literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
@@ -176,7 +184,9 @@ const server = http.createServer((req, res) => {
 
   // Admin-only: live connection status (total + per-channel counts,
   // including 변동채널 with their raw FQ_-prefixed ids) for talkie-ad.html's
-  // second panel. Requires TALKIE_ADMIN_KEY as a query param.
+  // status panel, PLUS a flat per-client list (id, nickname, channel, IP,
+  // connect time) for its 접속자 관리 panel. Requires TALKIE_ADMIN_KEY as a
+  // query param.
   if (path === '/status' && req.method === 'GET') {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
@@ -186,7 +196,43 @@ const server = http.createServer((req, res) => {
     channelMeta.forEach((meta, ch) => {
       channelsOut[ch] = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
     });
-    sendJson(res, 200, { total: clients.size, channels: channelsOut });
+    const clientsOut = [];
+    clients.forEach((c, id) => {
+      clientsOut.push({
+        id,
+        nickname: c.nickname || null,
+        // null == still on the channel-select screen (hasn't entered a
+        // channel yet, or just left one) — the client-side admin panel
+        // renders that case as "채널선택".
+        channel: c.channel,
+        connectedAt: c.connectedAt,
+        ip: c.ip || null,
+      });
+    });
+    sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut });
+    return;
+  }
+
+  // Admin-only: forcibly disconnect one client by its server-assigned id
+  // (never by IP — see the comment on getClientIp for why). Tells the
+  // client {type:'kicked'} first so it can drop itself straight back to the
+  // password screen, then closes the socket from this end regardless, so a
+  // client that's stuck or ignores the message still gets cut off.
+  if (path === '/kick' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      const target = clients.get(String(data.id));
+      if (!target) { sendJson(res, 404, { error: 'not found' }); return; }
+      send(target.ws, { type: 'kicked' });
+      // Small delay so the 'kicked' frame has a moment to actually reach the
+      // client before the socket goes away — the client's own close handler
+      // will still clean everything up server-side even if this never
+      // arrives (e.g. the client was already gone).
+      setTimeout(() => { try { target.ws.close(); } catch (e) {} }, 150);
+      sendJson(res, 200, { ok: true });
+    });
     return;
   }
 
@@ -197,7 +243,8 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 let nextId = 1;
-const clients = new Map();     // id -> {ws, channel: string|null}
+// id -> {ws, channel: string|null, role, ip, connectedAt, nickname: string|null}
+const clients = new Map();
 const channelMeta = new Map(); // channelId -> {desc: string|null, cap: number}
 // Every currently-open websocket, authenticated or not — used only to push
 // {type:'notice'} updates immediately to everyone, including someone who's
@@ -206,6 +253,19 @@ const rawSockets = new Set();
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
+}
+
+// The socket only ever sees Render's proxy IP directly, so the real client
+// IP has to be read off X-Forwarded-For (Render puts the real client IP
+// first in that list — see Render's own docs/support on this header).
+// This is purely informational (shown in talkie-ad.html so an admin has
+// something to go on if a kicked user reconnects) — it is NEVER used to
+// identify who to KICK, since a shared IP (same wifi, same carrier NAT)
+// would otherwise let one KICK hit innocent bystanders on that IP too.
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || '';
 }
 
 function getChannelMeta(ch) {
@@ -258,9 +318,10 @@ function leaveChannel(id) {
   }
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let authed = false;
   let myId = null;
+  const ip = getClientIp(req);
 
   // Track this socket for notice broadcasts and push the current notice
   // right away — this works even before 'join', so the password screen's
@@ -287,7 +348,7 @@ wss.on('connection', (ws) => {
       }
       authed = true;
       myId = String(nextId++);
-      clients.set(myId, { ws, channel: null, role });
+      clients.set(myId, { ws, channel: null, role, ip, connectedAt: Date.now(), nickname: null });
       send(ws, { type: 'welcome', id: myId, role });
       broadcastStats();
       return;
@@ -295,6 +356,14 @@ wss.on('connection', (ws) => {
 
     const me = clients.get(myId);
     if (!me) return;
+
+    if (data.type === 'set-nickname' && typeof data.nickname === 'string') {
+      // Informational only (see the protocol comment at the top of this
+      // file) — purely so talkie-ad.html's 접속자 관리 panel has something
+      // to show. Never used for auth or any access-control decision.
+      me.nickname = data.nickname.slice(0, 20) || null;
+      return;
+    }
 
     if (data.type === 'enter-channel' && typeof data.channel === 'string' && data.channel) {
       const ch = data.channel;
