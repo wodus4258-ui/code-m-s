@@ -17,6 +17,9 @@
 //   S->C  {type:'stats', total, channels:{<id>:{count,desc,cap}, ...}}
 //   S->C  {type:'kicked'}                              -- admin forced this client off; client
 //                                                          must drop straight to the password screen
+//   S->C  {type:'server-locked'}                       -- sent instead of 'welcome'/'auth-error' when
+//                                                          a 'join' arrives while ALL KILL is active;
+//                                                          client must NOT retry, just show 접속중지
 //
 // This server deliberately knows almost nothing about a channel's contents:
 // it only relays WebRTC signaling (offer/answer/ICE) between clients that
@@ -72,6 +75,28 @@ const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
 //                             and to forcibly disconnect ("KICK") a client.
 //                             Keep it out of source control.
 const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
+// TALKIE_ADMIN_KEY also guards two new admin actions used by talkie-ad.html's
+// [서버 관리] panel:
+//   POST /kick-all   { key }            -- "ALL KICK": force-disconnect every
+//                                           currently connected client at once
+//                                           (same as /kick, but everyone).
+//                                           Anyone can immediately type the
+//                                           password again and reconnect.
+//   POST /all-kill    { key, active }   -- "ALL KILL" ↔ "RES": active:true
+//                                           does an ALL KICK *and* flips the
+//                                           server into a locked state where
+//                                           every subsequent 'join' (right
+//                                           password or not, from anyone) is
+//                                           refused with {type:'server-locked'}
+//                                           until active:false is sent.
+//   GET  /lock-status                    -- public (no key): { locked } — lets
+//                                           a client still sitting on the
+//                                           password screen (i.e. before it
+//                                           has attempted to join at all) know
+//                                           to hide the password box and show
+//                                           "접속중지" instead of letting
+//                                           someone type a password that would
+//                                           just be refused.
 // The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
 // literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
 const OPERATOR_CHANNEL_ID = 'CH10';
@@ -109,6 +134,11 @@ let notices = {
   ch: { text: '', imageUrl: '', updatedAt: 0 },
 };
 const NOTICE_TARGETS = ['pw', 'ch'];
+
+// ALL KILL state. In-memory only (like everything else here) — resets to
+// unlocked on server restart. While true, no 'join' (from anyone, correct
+// password or not) succeeds; see the join handler below.
+let serverLocked = false;
 
 function readBody(req, cb) {
   let body = '';
@@ -209,7 +239,7 @@ const server = http.createServer((req, res) => {
         ip: c.ip || null,
       });
     });
-    sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut });
+    sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut, locked: serverLocked });
     return;
   }
 
@@ -233,6 +263,49 @@ const server = http.createServer((req, res) => {
       setTimeout(() => { try { target.ws.close(); } catch (e) {} }, 150);
       sendJson(res, 200, { ok: true });
     });
+    return;
+  }
+
+  // Admin-only: "ALL KICK" — force-disconnect every currently connected
+  // client in one shot. Unlike /all-kill below, this never touches
+  // serverLocked, so anyone kicked this way can retype the password and be
+  // straight back in.
+  if (path === '/kick-all' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      kickAllClients();
+      sendJson(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // Admin-only: "ALL KILL" (active:true) / "RES" (active:false). Turning it
+  // on does an ALL KICK and then keeps every future 'join' attempt locked
+  // out (see the join handler below) until this is called again with
+  // active:false. Turning it off never needs to kick anyone — nobody could
+  // have logged in while it was on.
+  if (path === '/all-kill' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      serverLocked = !!data.active;
+      if (serverLocked) kickAllClients();
+      sendJson(res, 200, { ok: true, locked: serverLocked });
+    });
+    return;
+  }
+
+  // Public: lets a client still sitting on the password screen (before it
+  // has ever sent 'join' over the websocket) know whether the server is
+  // currently under ALL KILL lockdown, so it can hide the password box and
+  // show "접속중지" instead of letting someone type a password that would
+  // just be refused. No admin key needed — this leaks nothing but a
+  // boolean, same trust level as the password screen itself.
+  if (path === '/lock-status' && req.method === 'GET') {
+    sendJson(res, 200, { locked: serverLocked });
     return;
   }
 
@@ -300,6 +373,23 @@ function broadcastStats() {
   clients.forEach((c) => { try { c.ws.send(msg); } catch (e) {} });
 }
 
+// "ALL KICK": force off every currently connected (authenticated) client at
+// once. Tells each one {type:'kicked'} first (same as the single-client
+// /kick path) so it can drop itself straight back to the password screen,
+// then closes every socket shortly after so a client that's stuck or
+// ignores the message still gets cut off. Does not touch serverLocked —
+// callers decide separately whether logins stay open afterward.
+function kickAllClients() {
+  const sockets = [];
+  clients.forEach((c) => {
+    send(c.ws, { type: 'kicked' });
+    sockets.push(c.ws);
+  });
+  setTimeout(() => {
+    sockets.forEach((ws) => { try { ws.close(); } catch (e) {} });
+  }, 150);
+}
+
 // Removes a client from whatever channel it's in (if any) and tells the
 // other members of that channel it's gone. Does not touch the socket and
 // does not broadcast stats itself — callers do that once, after any other
@@ -335,6 +425,15 @@ wss.on('connection', (ws, req) => {
 
     if (!authed) {
       if (data.type !== 'join') return;
+      // ALL KILL: refuse every join outright, correct password or not, and
+      // don't even look at data.password. The client must not treat this as
+      // a wrong-password case (no retry prompt) — see 'server-locked' in the
+      // client's handleServerMessage.
+      if (serverLocked) {
+        send(ws, { type: 'server-locked' });
+        ws.close();
+        return;
+      }
       // Either password authenticates; the operator password additionally
       // grants the 'operator' role (checked entirely server-side — the
       // client only ever learns its own role back via 'welcome').
