@@ -153,6 +153,17 @@ const NOTICE_TARGETS = ['pw', 'ch'];
 // password or not) succeeds; see the join handler below.
 let serverLocked = false;
 
+// 국경 봉쇄 ("country block") state. In-memory only, resets on restart.
+// While true, any 'join' from a client whose geoip-lite country is known
+// and is NOT 'KR' is refused exactly like ALL KILL (reuses the same
+// {type:'server-locked'} message so talkie.html needs no changes to
+// recognize it — it already shows "접속중지" for that message). A client
+// whose country can't be determined (private/dev IP, geoip miss — reported
+// as '-') is NOT blocked, so this never accidentally locks everyone out
+// just because geoip-lite failed to resolve an IP.
+let countryBlockActive = false;
+const COUNTRY_BLOCK_ALLOW = 'KR';
+
 // Rolling event log for talkie-ad.html's [LOG] view — login / logout /
 // channel-enter / kick, each with a snapshot of who/where/what-device at
 // that moment. In-memory only, so "언제부터 추적 가능한가" is simply "since
@@ -279,7 +290,7 @@ const server = http.createServer((req, res) => {
         device: c.device || null,
       });
     });
-    sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut, locked: serverLocked });
+    sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut, locked: serverLocked, countryBlocked: countryBlockActive });
     return;
   }
 
@@ -347,6 +358,23 @@ const server = http.createServer((req, res) => {
       serverLocked = !!data.active;
       if (serverLocked) kickAllClients();
       sendJson(res, 200, { ok: true, locked: serverLocked });
+    });
+    return;
+  }
+
+  // Admin-only: "국경 봉쇄" (active:true) / 해제 (active:false). Turning it
+  // on immediately kicks every currently-connected client whose geoip
+  // country is known and isn't 'KR', and from then on refuses every future
+  // 'join' from a non-KR IP (see the join handler) until turned off again.
+  // Unlike ALL KILL, KR clients are never affected either way.
+  if (path === '/country-block' && req.method === 'POST') {
+    readBody(req, (body) => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch (e) { sendJson(res, 400, { error: 'invalid json' }); return; }
+      if (!ADMIN_KEY || data.key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+      countryBlockActive = !!data.active;
+      if (countryBlockActive) kickNonKoreaClients();
+      sendJson(res, 200, { ok: true, countryBlocked: countryBlockActive });
     });
     return;
   }
@@ -488,6 +516,24 @@ function kickAllClients() {
   }, 150);
 }
 
+// "국경 봉쇄": force off every currently connected client whose geoip
+// country is known and isn't 'KR'. A client whose country is unresolved
+// ('-') is left alone — see the countryBlockActive comment above for why.
+function kickNonKoreaClients() {
+  const sockets = [];
+  clients.forEach((c, id) => {
+    if (c.country && c.country !== '-' && c.country !== COUNTRY_BLOCK_ALLOW) {
+      c.wasKicked = true;
+      logEvent('kick', id, c, { reason: 'country-block' });
+      send(c.ws, { type: 'kicked' });
+      sockets.push(c.ws);
+    }
+  });
+  setTimeout(() => {
+    sockets.forEach((ws) => { try { ws.close(); } catch (e) {} });
+  }, 150);
+}
+
 // Removes a client from whatever channel it's in (if any) and tells the
 // other members of that channel it's gone. Does not touch the socket and
 // does not broadcast stats itself — callers do that once, after any other
@@ -531,6 +577,16 @@ wss.on('connection', (ws, req) => {
       // a wrong-password case (no retry prompt) — see 'server-locked' in the
       // client's handleServerMessage.
       if (serverLocked) {
+        send(ws, { type: 'server-locked' });
+        ws.close();
+        return;
+      }
+      // 국경 봉쇄: 국가가 확인되었고 'KR'이 아니면 즉시 거부. 국가 판별이
+      // 안 된('-') 경우는 차단하지 않는다(geoip 실패로 전원 차단되는 사고
+      // 방지). ALL KILL과 동일한 메시지({type:'server-locked'})를 재사용해
+      // 클라이언트(talkie.html) 쪽 변경 없이도 곧바로 "접속중지" 화면이
+      // 뜨도록 한다.
+      if (countryBlockActive && geo.country && geo.country !== '-' && geo.country !== COUNTRY_BLOCK_ALLOW) {
         send(ws, { type: 'server-locked' });
         ws.close();
         return;
