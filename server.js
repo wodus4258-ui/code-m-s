@@ -148,7 +148,15 @@ const MAX_CHANNEL_CAP = 15;
 // The client always prefixes such ids with FREQ_CHANNEL_PREFIX so we can
 // tell them apart and clean them up.
 const FREQ_CHANNEL_PREFIX = 'FQ_';
-function isFreqChannel(ch) { return typeof ch === 'string' && ch.indexOf(FREQ_CHANNEL_PREFIX) === 0; }
+// 비밀 주파수(10~20자 임의 문자열) 변동채널 — talkie.html의 isFreqChannel()과
+// 마찬가지로, 입장 방식만 다를 뿐 6자리 주파수 채널과 완전히 동일하게
+// 취급한다(빈 채널 정리, 최소 인원(2명) 등). 접두사만 다르므로 별도
+// SECRET_FREQ_CHANNEL_PREFIX를 두고 isFreqChannel()이 둘 다 인식하게 한다.
+const SECRET_FREQ_CHANNEL_PREFIX = 'SFQ_';
+function isFreqChannel(ch) {
+  return typeof ch === 'string' &&
+    (ch.indexOf(FREQ_CHANNEL_PREFIX) === 0 || ch.indexOf(SECRET_FREQ_CHANNEL_PREFIX) === 0);
+}
 // Used only to pre-list all ten fixed channels in the /status admin
 // endpoint (with a 0 count) even before anyone has ever entered one —
 // channelMeta itself is only populated lazily, on first entry.
