@@ -1,8 +1,12 @@
 // Talkie signaling server
 // Implements exactly the protocol documented in the client:
-//   C->S  {type:'join', password:<string>}
-//   S->C  {type:'welcome', id, role:'user'|'operator'} -- only if password is correct
-//   S->C  {type:'auth-error'}                          -- if password is wrong, then closes
+//   C->S  {type:'join'}                                -- no start password anymore (폐기됨). A legacy
+//                                                          client may still send password:<operator pw>,
+//                                                          in which case it joins as 'operator'.
+//   S->C  {type:'welcome', id, role:'user'|'operator'}
+//   C->S  {type:'operator-auth', password:<string>}    -- sent when a client wants the "운영자" nickname
+//   S->C  {type:'operator-auth-ok'}                    -- correct operator password: role becomes 'operator'
+//   S->C  {type:'operator-auth-error'}                 -- wrong operator password (socket stays open)
 //   C->S  {type:'set-nickname', nickname:<string>}     -- informational only, for admin panel
 //   C->S  {type:'enter-channel', channel:<id>, ch10Password?:<string>}
 //   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}  -- peers already in that channel
@@ -39,24 +43,24 @@
 // so the admin panel (talkie-ad.html) can show who's connected — it is
 // never used for any access-control decision server-side.
 //
-// All three passwords below are checked here, server-side, so no client can
+// Both passwords below are checked here, server-side, so no client can
 // ever bypass them by editing/inspecting the page. Prefer setting all of
 // them via environment variables in your host's dashboard (e.g. Render >
 // Environment) rather than relying on the fallbacks below — if this file
 // lives in a public GitHub repo, a hardcoded password here is just as
 // exposed as it was in the old client-side check.
 //
-//   TALKIE_PASSWORD          general join password (existing)
-//   TALKIE_OPERATOR_PASSWORD alternate join password that additionally
-//                             grants the 'operator' role, which is the only
-//                             role allowed to take the "운영자" nickname
-//                             client-side. A join with either password
-//                             succeeds; only the role differs.
+//   (TALKIE_PASSWORD — 시작 비밀번호는 폐기되었습니다. 더 이상 사용되지 않으며
+//    Render Environment에 남아 있어도 무시됩니다.)
+//   TALKIE_OPERATOR_PASSWORD password that grants the 'operator' role, which
+//                             is the only role allowed to take the "운영자"
+//                             nickname client-side. Clients now prove it after
+//                             joining, via {type:'operator-auth'}, only when
+//                             they pick that nickname.
 //   TALKIE_CH10_PASSWORD     separate password required to enter the fixed
 //                             CH10 channel (비상 관리채널). Independent of
-//                             both passwords above — entering CH10 has
-//                             nothing to do with which password was used to
-//                             join in the first place.
+//                             the operator password above — entering CH10 has
+//                             nothing to do with which role a client has.
 //
 // Country/region/city in the admin panel come from the bundled geoip-lite
 // package (offline IP database, no per-request network calls) — run
@@ -70,7 +74,6 @@ const { WebSocketServer } = require('ws');
 let geoip = null;
 try { geoip = require('geoip-lite'); } catch (e) { geoip = null; }
 
-const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const OPERATOR_PASSWORD = process.env.TALKIE_OPERATOR_PASSWORD || '051627*';
 const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
 // Key required to manage the announcement banner and read the admin status
@@ -814,17 +817,12 @@ wss.on('connection', (ws, req) => {
         ws.close();
         return;
       }
-      // Either password authenticates; the operator password additionally
-      // grants the 'operator' role (checked entirely server-side — the
-      // client only ever learns its own role back via 'welcome').
-      let role = null;
-      if (data.password === PASSWORD) role = 'user';
-      else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) role = 'operator';
-      if (!role) {
-        send(ws, { type: 'auth-error' });
-        ws.close();
-        return;
-      }
+      // 시작 비밀번호는 폐기되었다: 누구나 'user'로 접속할 수 있다. 운영자 역할은
+      // 접속 후 {type:'operator-auth'}로 증명하는 것이 기본 경로이며(아래 참고),
+      // 구버전 클라이언트가 join에 운영자 비밀번호를 실어 보낸 경우에만 여기서
+      // 바로 'operator'가 된다. (역할 판정은 전부 서버에서 — 클라이언트는
+      // 'welcome'/'operator-auth-ok'로 자기 역할을 통보받을 뿐이다.)
+      const role = (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) ? 'operator' : 'user';
       authed = true;
       myId = String(nextId++);
       clients.set(myId, {
@@ -840,6 +838,18 @@ wss.on('connection', (ws, req) => {
 
     const me = clients.get(myId);
     if (!me) return;
+
+    if (data.type === 'operator-auth') {
+      // "운영자" 닉네임을 고른 클라이언트가 보내는 운영자 비밀번호 확인.
+      // 틀려도 소켓은 닫지 않는다 (클라이언트가 다시 입력할 수 있도록).
+      if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) {
+        me.role = 'operator';
+        send(ws, { type: 'operator-auth-ok' });
+      } else {
+        send(ws, { type: 'operator-auth-error' });
+      }
+      return;
+    }
 
     if (data.type === 'set-nickname' && typeof data.nickname === 'string') {
       // Informational only (see the protocol comment at the top of this
