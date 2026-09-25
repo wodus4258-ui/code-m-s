@@ -160,6 +160,17 @@ function isFreqChannel(ch) {
   return typeof ch === 'string' &&
     (ch.indexOf(FREQ_CHANNEL_PREFIX) === 0 || ch.indexOf(SECRET_FREQ_CHANNEL_PREFIX) === 0);
 }
+// 변동채널(주파수/비밀주파수) 무작위 대입 방지. 변동채널 id는 곧 그 채널의
+// "비밀번호" 역할을 하므로(아는 사람만 입장 가능), 짧은 시간에 서로 다른
+// FQ_/SFQ_ id로 enter-channel을 반복 시도하는 것은 스크립트를 이용한 무작위
+// 대입 공격 정황으로 본다. 한 클라이언트가 TALKIE_FREQ_ATTEMPT_WINDOW_MS
+// 시간 동안 TALKIE_FREQ_ATTEMPT_LIMIT회를 초과해 변동채널 입장을 시도하면
+// (성공/실패 무관, 매 시도를 카운트) 기존 관리자 KICK과 완전히 동일한
+// 방식(kicked 전송 → 소켓 종료 → 이벤트 로그 기록)으로 강제 접속 종료한다.
+// AUTO KICK과 달리 재접속 자체를 막지는 않는다 — 사람이 실수로 여러 채널을
+// 옮겨다닌 경우까지 영구 차단하지 않기 위함.
+const FREQ_ATTEMPT_LIMIT = Number(process.env.TALKIE_FREQ_ATTEMPT_LIMIT) || 20;
+const FREQ_ATTEMPT_WINDOW_MS = Number(process.env.TALKIE_FREQ_ATTEMPT_WINDOW_MS) || 60 * 60 * 1000; // 1시간
 // Used only to pre-list all ten fixed channels in the /status admin
 // endpoint (with a 0 count) even before anyone has ever entered one —
 // channelMeta itself is only populated lazily, on first entry.
@@ -641,13 +652,31 @@ function broadcastNotice() {
   rawSockets.forEach((s) => { try { s.send(msg); } catch (e) {} });
 }
 
+// {type:'stats'}는 로그인만 하면 누구에게나 주기적으로 뿌려지므로, 변동채널
+// (FQ_/SFQ_) id를 여기 그대로 실어 보내면 그 id(=주파수/비밀 문자열, 곧 그
+// 채널의 "비밀번호")가 전체 접속자에게 노출되어 채널 격리가 무의미해진다.
+// 그래서 변동채널 항목은 통째로 제외하고 고정채널(CH01~CH10)만 보내는 것을
+// 기본으로 하되, 딱 한 가지 예외를 둔다: 지금 CH10(비상 관리채널)에 들어와
+// 있는 클라이언트에게는 기존과 동일하게 변동채널 현황까지 포함한 전체
+// 목록을 보낸다 — talkie.html의 [현재 접속자 확인] 화면이 CH10 안에서만
+// "관리자-변동채널 현황" 섹션을 보여주는 것과 정확히 대응된다. CH10 자체가
+// 별도 ch10Password로 보호되어 있으므로, 이 전체 목록을 받는 대상도 자연히
+// 그 비밀번호를 아는 사람으로 제한된다. talkie-ad.html의 /status 엔드포인트
+// (ADMIN_KEY로 별도 인증)는 이 브로드캐스트와 무관한 별도 경로라 영향받지
+// 않는다.
 function broadcastStats() {
-  const channelsOut = {};
+  const fullChannels = {};
+  const publicChannels = {};
   channelMeta.forEach((meta, ch) => {
-    channelsOut[ch] = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
+    const entry = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
+    fullChannels[ch] = entry;
+    if (!isFreqChannel(ch)) publicChannels[ch] = entry;
   });
-  const msg = JSON.stringify({ type: 'stats', total: clients.size, channels: channelsOut });
-  clients.forEach((c) => { try { c.ws.send(msg); } catch (e) {} });
+  const fullMsg = JSON.stringify({ type: 'stats', total: clients.size, channels: fullChannels });
+  const publicMsg = JSON.stringify({ type: 'stats', total: clients.size, channels: publicChannels });
+  clients.forEach((c) => {
+    try { c.ws.send(c.channel === OPERATOR_CHANNEL_ID ? fullMsg : publicMsg); } catch (e) {}
+  });
 }
 
 // "ALL KICK": force off every currently connected (authenticated) client at
@@ -716,6 +745,33 @@ function kickChannelClients(ch) {
   });
   setTimeout(() => { sockets.forEach((ws) => { try { ws.close(); } catch (e) {} }); }, 150);
   return sockets.length;
+}
+
+// 단일 클라이언트 KICK — /kick, kickAllClients 등과 완전히 동일한 절차
+// (wasKicked 표시 → 로그 기록 → 'kicked' 전송 → 150ms 뒤 소켓 종료)를 한
+// 곳에 모아, 변동채널 무작위 대입 방지(아래 checkFreqBruteForce)에서도
+// 그대로 재사용한다.
+function kickClient(id, c, reason) {
+  c.wasKicked = true;
+  logEvent('kick', id, c, reason ? { reason } : undefined);
+  send(c.ws, { type: 'kicked' });
+  setTimeout(() => { try { c.ws.close(); } catch (e) {} }, 150);
+}
+
+// 변동채널(FQ_/SFQ_) enter-channel 시도를 매번 기록하고, 최근
+// FREQ_ATTEMPT_WINDOW_MS 동안의 횟수가 FREQ_ATTEMPT_LIMIT을 넘으면 그
+// 클라이언트를 KICK한다. true를 반환하면 이미 KICK 처리된 것이므로 호출
+// 쪽에서는 해당 enter-channel 요청을 더 이상 진행하지 않아야 한다.
+function checkFreqBruteForce(id, c) {
+  const now = Date.now();
+  c.freqAttempts.push(now);
+  const cutoff = now - FREQ_ATTEMPT_WINDOW_MS;
+  while (c.freqAttempts.length && c.freqAttempts[0] < cutoff) c.freqAttempts.shift();
+  if (c.freqAttempts.length > FREQ_ATTEMPT_LIMIT) {
+    kickClient(id, c, 'freq-bruteforce');
+    return true;
+  }
+  return false;
 }
 
 // "채널 AUTO KICK": 특정 채널에 현재 참여 중인 전원을, 각자 본인의
@@ -828,7 +884,7 @@ wss.on('connection', (ws, req) => {
       clients.set(myId, {
         ws, channel: null, role, ip, connectedAt: Date.now(), nickname: null,
         country: geo.country, region: geo.region, city: geo.city, device,
-        wasKicked: false,
+        wasKicked: false, freqAttempts: [],
       });
       send(ws, { type: 'welcome', id: myId, role });
       logEvent('login', myId, clients.get(myId));
@@ -861,6 +917,10 @@ wss.on('connection', (ws, req) => {
 
     if (data.type === 'enter-channel' && typeof data.channel === 'string' && data.channel) {
       const ch = data.channel;
+      // 변동채널(FQ_/SFQ_)은 id 자체가 비밀번호 역할을 하므로, 여기서 매
+      // 시도를 카운트해 무작위 대입 정황이면 즉시 KICK하고 더 진행하지
+      // 않는다(성공/실패 여부와 무관하게 시도 자체를 센다).
+      if (isFreqChannel(ch) && checkFreqBruteForce(myId, me)) return;
       // CH10 (비상 관리채널) requires its own dedicated password on every
       // entry attempt — independent of both the general and operator join
       // passwords, and independent of the client's role. Checked here so a
