@@ -1,222 +1,60 @@
 // Talkie signaling server
 // Implements exactly the protocol documented in the client:
-//   C->S  {type:'join'}                                -- no start password anymore (폐기됨). A legacy
-//                                                          client may still send password:<operator pw>,
-//                                                          in which case it joins as 'operator'.
-//   S->C  {type:'welcome', id, role:'user'|'operator'}
-//   C->S  {type:'operator-auth', password:<string>}    -- sent when a client wants the "운영자" nickname
-//   S->C  {type:'operator-auth-ok'}                    -- correct operator password: role becomes 'operator'
-//   S->C  {type:'operator-auth-error'}                 -- wrong operator password (socket stays open)
-//   C->S  {type:'set-nickname', nickname:<string>}     -- informational only, for admin panel
+//   C->S  {type:'join', password:<string>}             -- 시작 비밀번호(일반/운영자). 서버에서 검증.
+//   S->C  {type:'welcome', id, role:'user'|'operator'} -- 비밀번호 일치 시
+//   S->C  {type:'auth-error'}                          -- 비밀번호 불일치 → 소켓 즉시 닫힘
+//   C->S  {type:'operator-auth', password:<string>}    -- "운영자" 닉네임 선택 시 별도 인증
+//   S->C  {type:'operator-auth-ok'} | {type:'operator-auth-error'}
+//   C->S  {type:'set-nickname', nickname:<string>}
 //   C->S  {type:'enter-channel', channel:<id>, ch10Password?:<string>}
-//   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}  -- peers already in that channel
+//   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}
 //   S->C  {type:'channel-full', channel}
-//   S->C  {type:'channel-auth-error', channel}         -- CH10 only, wrong/missing ch10Password
+//   S->C  {type:'channel-auth-error', channel}         -- CH10 only
 //   C->S  {type:'leave-channel'}
-//   S->C  {type:'peer-joined', channel, id}            -- only to others already in that same channel
-//   S->C  {type:'peer-left', channel, id}              -- only to others in that same channel
-//   C->S  {type:'signal', to:<peerId>, kind:'offer'|'answer'|'ice', payload}
-//   S->C  {type:'signal', from:<peerId>, kind:'offer'|'answer'|'ice', payload}
+//   S->C  {type:'peer-joined', channel, id}
+//   S->C  {type:'peer-left', channel, id}
+//   C->S  {type:'signal', to:<peerId>, kind, payload}
+//   S->C  {type:'signal', from:<peerId>, kind, payload}
 //   C->S  {type:'set-channel-info', channel, desc, cap}
-//   S->C  {type:'stats', total, channels:{<id>:{count,desc,cap}, ...}}
-//   S->C  {type:'kicked'}                              -- admin forced this client off; client
-//                                                          must drop straight to the password screen
-//   S->C  {type:'server-locked'}                       -- sent instead of 'welcome'/'auth-error' when
-//                                                          a 'join' arrives while ALL KILL is active;
-//                                                          client must NOT retry, just show 접속중지
-//
-// This server deliberately knows almost nothing about a channel's contents:
-// it only relays WebRTC signaling (offer/answer/ICE) between clients that
-// are BOTH currently members of the same channel, and it never relays or
-// notifies across channels — each channel is a fully isolated P2P mesh, so
-// one channel's load never grows with the whole app's user count.
-//
-// The one thing this server DOES track authoritatively is the small set of
-// numbers the channel-select screen needs before a client has joined any
-// mesh at all: each channel's description, its capacity, its current
-// member count, and the system-wide total of connected clients. That's
-// pushed to every authenticated client (in or out of a channel) any time it
-// changes, as {type:'stats'}. Everything else about a channel — chat text,
-// files, the talkie-talkie radio — is exchanged purely peer-to-peer inside
-// that channel's mesh and never touches this server. The one exception is
-// the nickname: the client also reports it here (via 'set-nickname'), purely
-// so the admin panel (talkie-ad.html) can show who's connected — it is
-// never used for any access-control decision server-side.
-//
-// Both passwords below are checked here, server-side, so no client can
-// ever bypass them by editing/inspecting the page. Prefer setting all of
-// them via environment variables in your host's dashboard (e.g. Render >
-// Environment) rather than relying on the fallbacks below — if this file
-// lives in a public GitHub repo, a hardcoded password here is just as
-// exposed as it was in the old client-side check.
-//
-//   (TALKIE_PASSWORD — 시작 비밀번호는 폐기되었습니다. 더 이상 사용되지 않으며
-//    Render Environment에 남아 있어도 무시됩니다.)
-//   TALKIE_OPERATOR_PASSWORD password that grants the 'operator' role, which
-//                             is the only role allowed to take the "운영자"
-//                             nickname client-side. Clients now prove it after
-//                             joining, via {type:'operator-auth'}, only when
-//                             they pick that nickname.
-//   TALKIE_CH10_PASSWORD     separate password required to enter the fixed
-//                             CH10 channel (비상 관리채널). Independent of
-//                             the operator password above — entering CH10 has
-//                             nothing to do with which role a client has.
-//
-// Country/region/city in the admin panel come from the bundled geoip-lite
-// package (offline IP database, no per-request network calls) — run
-// `npm install` after pulling this change so that dependency is present.
+//   S->C  {type:'stats', total, channels:{...}}
+//   S->C  {type:'kicked'}                              -- 관리자 KICK
+//   S->C  {type:'server-locked'}                       -- ALL KILL / 국경봉쇄 / AUTO KICK
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
-// Offline IP->country/region/city lookup (bundled database, no network
-// calls per-request). Wrapped in try/catch so a missing `npm install`
-// degrades to '-' fields instead of crashing the whole server.
 let geoip = null;
 try { geoip = require('geoip-lite'); } catch (e) { geoip = null; }
 
+const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
 const OPERATOR_PASSWORD = process.env.TALKIE_OPERATOR_PASSWORD || '051627*';
 const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
-// Key required to manage the announcement banner and read the admin status
-// endpoint (talkie-ad.html). This is a separate, server-verified secret —
-// unrelated to the "4258" screen-lock PIN typed into talkie-ad.html itself,
-// which is only a client-side gate on that page's UI. Set this via Render's
-// Environment tab like the passwords above.
-//   TALKIE_ADMIN_KEY         required by talkie-ad.html to read/write the
-//                             notice banner, view live connection stats
-//                             (including each client's nickname/IP/channel),
-//                             and to forcibly disconnect ("KICK") a client.
-//                             Keep it out of source control.
 const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
-// TALKIE_ADMIN_KEY also guards two new admin actions used by talkie-ad.html's
-// [서버 관리] panel:
-//   POST /kick-all   { key }            -- "ALL KICK": force-disconnect every
-//                                           currently connected client at once
-//                                           (same as /kick, but everyone).
-//                                           Anyone can immediately type the
-//                                           password again and reconnect.
-//   POST /all-kill    { key, active }   -- "ALL KILL" ↔ "RES": active:true
-//                                           does an ALL KICK *and* flips the
-//                                           server into a locked state where
-//                                           every subsequent 'join' (right
-//                                           password or not, from anyone) is
-//                                           refused with {type:'server-locked'}
-//                                           until active:false is sent.
-//   GET  /lock-status                    -- public (no key): { locked } — lets
-//                                           a client still sitting on the
-//                                           password screen (i.e. before it
-//                                           has attempted to join at all) know
-//                                           to hide the password box and show
-//                                           "접속중지" instead of letting
-//                                           someone type a password that would
-//                                           just be refused.
-//   GET  /log         ?key=...           -- admin-only: the full rolling
-//                                           event log (login/logout/
-//                                           channel-enter/kick) for
-//                                           talkie-ad.html's [LOG] view.
-//   POST /auto-kick    { key, kind, country?, region?, ip?, device?, label? }
-//                                        -- admin-only: add an AUTO KICK
-//                                           rule (kind: 'country'|'region'|
-//                                           'ip'|'specific'); kicks any
-//                                           currently-connected match right
-//                                           away and blocks that condition
-//                                           from joining from then on.
-//   GET  /auto-kick-list ?key=...        -- admin-only: list active AUTO
-//                                           KICK rules (for [AUTO KICK 해제]).
-//   POST /auto-kick-remove { key, id }   -- admin-only: remove one AUTO KICK
-//                                           rule by id.
-//   POST /kick-channel { key, channel }  -- admin-only: KICK everyone
-//                                           currently in one channel.
-//   POST /auto-kick-channel { key, channel }
-//                                        -- admin-only: AUTO KICK everyone
-//                                           currently in one channel, each
-//                                           by their own 'specific' (country+
-//                                           region+ip+device) condition.
-// The one fixed channel id that requires CH10_PASSWORD to enter. Matches the
-// literal id the client sends for its "CH10" row (see CHANNELS in talkie.html).
 const OPERATOR_CHANNEL_ID = 'CH10';
 const PORT = process.env.PORT || 10000;
 const DEFAULT_CHANNEL_CAP = 10;
-// Fixed channels (CH01~CH10) and 변동채널(frequency channels) allow different
-// minimum caps — fixed channels are meant to stay reasonably large (10~15),
-// while a 변동채널 can be as small as a 1:1 conversation plus one more (2~15).
-// Both share the same upper bound.
 const MIN_FIXED_CHANNEL_CAP = 10;
 const MIN_FREQ_CHANNEL_CAP = 2;
 const MAX_CHANNEL_CAP = 15;
-// A '변동채널' (frequency-matched channel) is just a channel whose id the
-// client derives from a 6-digit frequency instead of a fixed CH01~CH10 id
-// (see talkie.html). No protocol change was needed for that — any string
-// is a valid channel id here already — but those channels should NOT
-// persist once empty (unlike the fixed channels, which always exist).
-// The client always prefixes such ids with FREQ_CHANNEL_PREFIX so we can
-// tell them apart and clean them up.
 const FREQ_CHANNEL_PREFIX = 'FQ_';
-// 비밀 주파수(10~20자 임의 문자열) 변동채널 — talkie.html의 isFreqChannel()과
-// 마찬가지로, 입장 방식만 다를 뿐 6자리 주파수 채널과 완전히 동일하게
-// 취급한다(빈 채널 정리, 최소 인원(2명) 등). 접두사만 다르므로 별도
-// SECRET_FREQ_CHANNEL_PREFIX를 두고 isFreqChannel()이 둘 다 인식하게 한다.
 const SECRET_FREQ_CHANNEL_PREFIX = 'SFQ_';
 function isFreqChannel(ch) {
   return typeof ch === 'string' &&
     (ch.indexOf(FREQ_CHANNEL_PREFIX) === 0 || ch.indexOf(SECRET_FREQ_CHANNEL_PREFIX) === 0);
 }
-// 변동채널(주파수/비밀주파수) 무작위 대입 방지. 변동채널 id는 곧 그 채널의
-// "비밀번호" 역할을 하므로(아는 사람만 입장 가능), 짧은 시간에 서로 다른
-// FQ_/SFQ_ id로 enter-channel을 반복 시도하는 것은 스크립트를 이용한 무작위
-// 대입 공격 정황으로 본다. 한 클라이언트가 TALKIE_FREQ_ATTEMPT_WINDOW_MS
-// 시간 동안 TALKIE_FREQ_ATTEMPT_LIMIT회를 초과해 변동채널 입장을 시도하면
-// (성공/실패 무관, 매 시도를 카운트) 기존 관리자 KICK과 완전히 동일한
-// 방식(kicked 전송 → 소켓 종료 → 이벤트 로그 기록)으로 강제 접속 종료한다.
-// AUTO KICK과 달리 재접속 자체를 막지는 않는다 — 사람이 실수로 여러 채널을
-// 옮겨다닌 경우까지 영구 차단하지 않기 위함.
 const FREQ_ATTEMPT_LIMIT = Number(process.env.TALKIE_FREQ_ATTEMPT_LIMIT) || 20;
-const FREQ_ATTEMPT_WINDOW_MS = Number(process.env.TALKIE_FREQ_ATTEMPT_WINDOW_MS) || 60 * 60 * 1000; // 1시간
-// Used only to pre-list all ten fixed channels in the /status admin
-// endpoint (with a 0 count) even before anyone has ever entered one —
-// channelMeta itself is only populated lazily, on first entry.
+const FREQ_ATTEMPT_WINDOW_MS = Number(process.env.TALKIE_FREQ_ATTEMPT_WINDOW_MS) || 60 * 60 * 1000;
 const FIXED_CHANNEL_IDS = ['CH01','CH02','CH03','CH04','CH05','CH06','CH07','CH08','CH09','CH10'];
 
-// Two independent server-wide announcements, kept in memory only (reset on
-// server restart), one per banner: 'pw' drives the banner under the
-// password screen, 'ch' drives the banner on the channel-select screen.
-// They're published/edited separately from talkie-ad.html and pushed to
-// clients together (see noticePayload) so each client-side banner just
-// reads the slot it cares about.
 let notices = {
   pw: { text: '', imageUrl: '', updatedAt: 0 },
   ch: { text: '', imageUrl: '', updatedAt: 0 },
 };
 const NOTICE_TARGETS = ['pw', 'ch'];
 
-// ALL KILL state. In-memory only (like everything else here) — resets to
-// unlocked on server restart. While true, no 'join' (from anyone, correct
-// password or not) succeeds; see the join handler below.
 let serverLocked = false;
-
-// 국경 봉쇄 ("country block") state. In-memory only, resets on restart.
-// While true, any 'join' from a client whose geoip-lite country is known
-// and is NOT 'KR' is refused exactly like ALL KILL (reuses the same
-// {type:'server-locked'} message so talkie.html needs no changes to
-// recognize it — it already shows "접속중지" for that message). A client
-// whose country can't be determined (private/dev IP, geoip miss — reported
-// as '-') is NOT blocked, so this never accidentally locks everyone out
-// just because geoip-lite failed to resolve an IP.
 let countryBlockActive = false;
 const COUNTRY_BLOCK_ALLOW = 'KR';
 
-// AUTO KICK 규칙. 관리자가 talkie-ad.html의 [AUTO KICK] 팝업(국가/지역/IP/
-// 특정) 또는 채널 팝업의 [채널 AUTO KICK]에서 만든, "이 조건에 맞으면 이후
-// 접속도 계속 차단한다"는 규칙 목록. In-memory only, like everything else
-// here — resets on restart.
-//   kind:'country'  — country 코드가 일치하면 차단
-//   kind:'region'   — country + region이 모두 일치해야 차단 (region 코드는
-//                      국가마다 겹칠 수 있어 country를 함께 본다)
-//   kind:'ip'       — ip가 정확히 일치하면 차단
-//   kind:'specific' — country + region + ip + device가 전부 일치하는
-//                      "교집합"일 때만 차단 (가장 좁은 범위, 팝업의 [특정])
-// 규칙은 join 시점에 이미 계산해둔 geoip/UA 값과 대조해 로그인 자체를 막고,
-// 새 규칙이 추가되는 순간에는 이미 접속 중인 클라이언트 중 일치하는 사람도
-// 즉시 KICK한다(kickClientsMatchingRule).
 const autoKickRules = [];
 let nextRuleId = 1;
 
@@ -241,18 +79,11 @@ function isAutoKickBlocked(cand) {
   return autoKickRules.some((r) => ruleMatchesCandidate(r, cand));
 }
 
-// Rolling event log for talkie-ad.html's [LOG] view — login / logout /
-// channel-enter / kick, each with a snapshot of who/where/what-device at
-// that moment. In-memory only, so "언제부터 추적 가능한가" is simply "since
-// this server process last started" (same lifetime as every other piece of
-// state here). Capped so a long-running server doesn't grow this forever.
 const eventLog = [];
 const MAX_LOG_ENTRIES = 5000;
 function logEvent(type, id, c, extra) {
   const entry = Object.assign({
-    type,
-    id,
-    ts: Date.now(),
+    type, id, ts: Date.now(),
     nickname: c ? (c.nickname || null) : null,
     ip: c ? (c.ip || null) : null,
     country: c ? (c.country || null) : null,
@@ -291,9 +122,6 @@ function noticePayload() {
 const server = http.createServer((req, res) => {
   const path = (req.url || '').split('?')[0];
 
-  // CORS preflight for talkie-ad.html, which may be opened from a
-  // different origin (a local file, or a separate static host) than this
-  // signaling server.
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -304,20 +132,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Public: anyone (including a client still sitting on the password
-  // screen, before it has authenticated over the websocket at all) can
-  // read the current notices. Returns both slots at once — this is what
-  // lets the password-screen banner and the channel-select banner each
-  // show their own text/image before (and independent of) login.
   if (path === '/notice' && req.method === 'GET') {
     sendJson(res, 200, { pw: notices.pw, ch: notices.ch });
     return;
   }
 
-  // Admin-only: publish/replace one of the two notice slots. Requires
-  // TALKIE_ADMIN_KEY plus a target of 'pw' (password screen) or 'ch'
-  // (channel-select screen) — the two are edited independently, so this
-  // never touches the other slot.
   if (path === '/notice' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -336,11 +155,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: live connection status (total + per-channel counts,
-  // including 변동채널 with their raw FQ_-prefixed ids) for talkie-ad.html's
-  // status panel, PLUS a flat per-client list (id, nickname, channel, IP,
-  // connect time) for its 접속자 관리 panel. Requires TALKIE_ADMIN_KEY as a
-  // query param.
   if (path === '/status' && req.method === 'GET') {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
@@ -355,9 +169,6 @@ const server = http.createServer((req, res) => {
       clientsOut.push({
         id,
         nickname: c.nickname || null,
-        // null == still on the channel-select screen (hasn't entered a
-        // channel yet, or just left one) — the client-side admin panel
-        // renders that case as "채널선택".
         channel: c.channel,
         connectedAt: c.connectedAt,
         ip: c.ip || null,
@@ -371,9 +182,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: the full rolling event log (login/logout/channel-enter/kick)
-  // for talkie-ad.html's [LOG] view. See eventLog/logEvent above for what's
-  // tracked and since when.
   if (path === '/log' && req.method === 'GET') {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
@@ -382,11 +190,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: forcibly disconnect one client by its server-assigned id
-  // (never by IP — see the comment on getClientIp for why). Tells the
-  // client {type:'kicked'} first so it can drop itself straight back to the
-  // password screen, then closes the socket from this end regardless, so a
-  // client that's stuck or ignores the message still gets cut off.
   if (path === '/kick' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -397,20 +200,12 @@ const server = http.createServer((req, res) => {
       target.wasKicked = true;
       logEvent('kick', String(data.id), target);
       send(target.ws, { type: 'kicked' });
-      // Small delay so the 'kicked' frame has a moment to actually reach the
-      // client before the socket goes away — the client's own close handler
-      // will still clean everything up server-side even if this never
-      // arrives (e.g. the client was already gone).
       setTimeout(() => { try { target.ws.close(); } catch (e) {} }, 150);
       sendJson(res, 200, { ok: true });
     });
     return;
   }
 
-  // Admin-only: "ALL KICK" — force-disconnect every currently connected
-  // client in one shot. Unlike /all-kill below, this never touches
-  // serverLocked, so anyone kicked this way can retype the password and be
-  // straight back in.
   if (path === '/kick-all' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -422,11 +217,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: "ALL KILL" (active:true) / "RES" (active:false). Turning it
-  // on does an ALL KICK and then keeps every future 'join' attempt locked
-  // out (see the join handler below) until this is called again with
-  // active:false. Turning it off never needs to kick anyone — nobody could
-  // have logged in while it was on.
   if (path === '/all-kill' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -439,11 +229,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: "국경 봉쇄" (active:true) / 해제 (active:false). Turning it
-  // on immediately kicks every currently-connected client whose geoip
-  // country is known and isn't 'KR', and from then on refuses every future
-  // 'join' from a non-KR IP (see the join handler) until turned off again.
-  // Unlike ALL KILL, KR clients are never affected either way.
   if (path === '/country-block' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -456,9 +241,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: "AUTO KICK" 규칙 추가. kind별로 필요한 필드가 다르다(위
-  // autoKickRules 선언부 주석 참고). 규칙을 추가하는 즉시 현재 접속 중인
-  // 클라이언트 중 일치하는 사람도 함께 KICK한다.
   if (path === '/auto-kick' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -487,8 +269,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: 현재 활성화된 AUTO KICK 규칙 목록 — talkie-ad.html의
-  // [AUTO KICK 해제] 팝업이 사용한다.
   if (path === '/auto-kick-list' && req.method === 'GET') {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
@@ -497,8 +277,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: AUTO KICK 규칙 해제(삭제). 이미 KICK된 세션을 되돌리지는
-  // 않는다 — 해제 이후의 접속부터 다시 허용될 뿐이다.
   if (path === '/auto-kick-remove' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -513,8 +291,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: "채널 KICK" — 지정한 채널에 현재 참여 중인 전원을 KICK한다
-  // (AUTO KICK 규칙은 만들지 않으므로 재접속/재입장은 그대로 가능).
   if (path === '/kick-channel' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -528,8 +304,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin-only: "채널 AUTO KICK" — 지정한 채널에 현재 참여 중인 전원을 각자
-  // 본인 조건("특정")으로 AUTO KICK한다.
   if (path === '/auto-kick-channel' && req.method === 'POST') {
     readBody(req, (body) => {
       let data;
@@ -543,12 +317,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Public: lets a client still sitting on the password screen (before it
-  // has ever sent 'join' over the websocket) know whether the server is
-  // currently under ALL KILL lockdown, so it can hide the password box and
-  // show "접속중지" instead of letting someone type a password that would
-  // just be refused. No admin key needed — this leaks nothing but a
-  // boolean, same trust level as the password screen itself.
   if (path === '/lock-status' && req.method === 'GET') {
     sendJson(res, 200, { locked: serverLocked });
     return;
@@ -561,36 +329,20 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 let nextId = 1;
-// id -> {ws, channel: string|null, role, ip, connectedAt, nickname: string|null}
 const clients = new Map();
-const channelMeta = new Map(); // channelId -> {desc: string|null, cap: number}
-// Every currently-open websocket, authenticated or not — used only to push
-// {type:'notice'} updates immediately to everyone, including someone who's
-// still sitting on the password screen (see wss.on('connection') below).
+const channelMeta = new Map();
 const rawSockets = new Set();
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
 
-// The socket only ever sees Render's proxy IP directly, so the real client
-// IP has to be read off X-Forwarded-For (Render puts the real client IP
-// first in that list — see Render's own docs/support on this header).
-// This is purely informational (shown in talkie-ad.html so an admin has
-// something to go on if a kicked user reconnects) — it is NEVER used to
-// identify who to KICK, since a shared IP (same wifi, same carrier NAT)
-// would otherwise let one KICK hit innocent bystanders on that IP too.
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return String(xff).split(',')[0].trim();
   return (req.socket && req.socket.remoteAddress) || '';
 }
 
-// Best-effort country/region/city for an IP, using the bundled geoip-lite
-// database (no external requests). Private/local IPs (dev, or a host that
-// doesn't forward a real client IP) simply come back as '-' fields — this
-// is purely informational for the admin panel, never used for any
-// access-control decision.
 function getGeoInfo(ip) {
   if (!geoip || !ip) return { country: '-', region: '-', city: '-' };
   let g = null;
@@ -603,11 +355,6 @@ function getGeoInfo(ip) {
   };
 }
 
-// Coarse device/browser label parsed from the User-Agent header the browser
-// sends on the websocket upgrade request. This is a self-reported string a
-// client could fake, and modern browsers increasingly freeze/generalize it
-// for privacy — treat it as a rough hint for the admin panel, not a hard
-// device fingerprint.
 function parseDeviceLabel(ua) {
   if (!ua) return '-';
   const s = String(ua);
@@ -652,18 +399,6 @@ function broadcastNotice() {
   rawSockets.forEach((s) => { try { s.send(msg); } catch (e) {} });
 }
 
-// {type:'stats'}는 로그인만 하면 누구에게나 주기적으로 뿌려지므로, 변동채널
-// (FQ_/SFQ_) id를 여기 그대로 실어 보내면 그 id(=주파수/비밀 문자열, 곧 그
-// 채널의 "비밀번호")가 전체 접속자에게 노출되어 채널 격리가 무의미해진다.
-// 그래서 변동채널 항목은 통째로 제외하고 고정채널(CH01~CH10)만 보내는 것을
-// 기본으로 하되, 딱 한 가지 예외를 둔다: 지금 CH10(비상 관리채널)에 들어와
-// 있는 클라이언트에게는 기존과 동일하게 변동채널 현황까지 포함한 전체
-// 목록을 보낸다 — talkie.html의 [현재 접속자 확인] 화면이 CH10 안에서만
-// "관리자-변동채널 현황" 섹션을 보여주는 것과 정확히 대응된다. CH10 자체가
-// 별도 ch10Password로 보호되어 있으므로, 이 전체 목록을 받는 대상도 자연히
-// 그 비밀번호를 아는 사람으로 제한된다. talkie-ad.html의 /status 엔드포인트
-// (ADMIN_KEY로 별도 인증)는 이 브로드캐스트와 무관한 별도 경로라 영향받지
-// 않는다.
 function broadcastStats() {
   const fullChannels = {};
   const publicChannels = {};
@@ -679,12 +414,6 @@ function broadcastStats() {
   });
 }
 
-// "ALL KICK": force off every currently connected (authenticated) client at
-// once. Tells each one {type:'kicked'} first (same as the single-client
-// /kick path) so it can drop itself straight back to the password screen,
-// then closes every socket shortly after so a client that's stuck or
-// ignores the message still gets cut off. Does not touch serverLocked —
-// callers decide separately whether logins stay open afterward.
 function kickAllClients() {
   const sockets = [];
   clients.forEach((c, id) => {
@@ -698,9 +427,6 @@ function kickAllClients() {
   }, 150);
 }
 
-// "국경 봉쇄": force off every currently connected client whose geoip
-// country is known and isn't 'KR'. A client whose country is unresolved
-// ('-') is left alone — see the countryBlockActive comment above for why.
 function kickNonKoreaClients() {
   const sockets = [];
   clients.forEach((c, id) => {
@@ -716,8 +442,6 @@ function kickNonKoreaClients() {
   }, 150);
 }
 
-// AUTO KICK 규칙에 걸리는, 현재 접속 중인 클라이언트를 즉시 KICK. 규칙이
-// 새로 추가된 직후 한 번 호출해 "이미 들어와 있던 사람"도 놓치지 않는다.
 function kickClientsMatchingRule(rule) {
   const sockets = [];
   clients.forEach((c, id) => {
@@ -731,8 +455,6 @@ function kickClientsMatchingRule(rule) {
   setTimeout(() => { sockets.forEach((ws) => { try { ws.close(); } catch (e) {} }); }, 150);
 }
 
-// "채널 KICK": 특정 채널에 현재 참여 중인 전원을 KICK한다. AUTO KICK 규칙은
-// 만들지 않으므로 재접속/재입장은 그대로 가능하다.
 function kickChannelClients(ch) {
   const sockets = [];
   clients.forEach((c, id) => {
@@ -747,10 +469,6 @@ function kickChannelClients(ch) {
   return sockets.length;
 }
 
-// 단일 클라이언트 KICK — /kick, kickAllClients 등과 완전히 동일한 절차
-// (wasKicked 표시 → 로그 기록 → 'kicked' 전송 → 150ms 뒤 소켓 종료)를 한
-// 곳에 모아, 변동채널 무작위 대입 방지(아래 checkFreqBruteForce)에서도
-// 그대로 재사용한다.
 function kickClient(id, c, reason) {
   c.wasKicked = true;
   logEvent('kick', id, c, reason ? { reason } : undefined);
@@ -758,10 +476,6 @@ function kickClient(id, c, reason) {
   setTimeout(() => { try { c.ws.close(); } catch (e) {} }, 150);
 }
 
-// 변동채널(FQ_/SFQ_) enter-channel 시도를 매번 기록하고, 최근
-// FREQ_ATTEMPT_WINDOW_MS 동안의 횟수가 FREQ_ATTEMPT_LIMIT을 넘으면 그
-// 클라이언트를 KICK한다. true를 반환하면 이미 KICK 처리된 것이므로 호출
-// 쪽에서는 해당 enter-channel 요청을 더 이상 진행하지 않아야 한다.
 function checkFreqBruteForce(id, c) {
   const now = Date.now();
   c.freqAttempts.push(now);
@@ -774,11 +488,6 @@ function checkFreqBruteForce(id, c) {
   return false;
 }
 
-// "채널 AUTO KICK": 특정 채널에 현재 참여 중인 전원을, 각자 본인의
-// country+region+ip+device 교집합("특정" 조건)으로 AUTO KICK 규칙을 만들면서
-// KICK한다. 채널 전체를 국가/지역/IP 단위로 뭉뚱그려 막으면 그 채널과 무관한
-// 다른 사용자까지 함께 막힐 수 있으므로, 일부러 가장 좁은 "특정" 조건만
-// 사용한다.
 function autoKickChannelClients(ch) {
   const addedRules = [];
   const sockets = [];
@@ -808,19 +517,12 @@ function autoKickChannelClients(ch) {
   return addedRules;
 }
 
-// Removes a client from whatever channel it's in (if any) and tells the
-// other members of that channel it's gone. Does not touch the socket and
-// does not broadcast stats itself — callers do that once, after any other
-// state changes they're making in the same operation.
 function leaveChannel(id) {
   const c = clients.get(id);
   if (!c || !c.channel) return;
   const ch = c.channel;
   c.channel = null;
   broadcastToChannelExcept(ch, id, { type: 'peer-left', channel: ch, id });
-  // 변동채널: once the last member leaves, the room ceases to exist — drop
-  // its meta entirely so it doesn't linger in memory or in future stats
-  // broadcasts. Fixed channels (CH01~CH10) are left alone, on purpose.
   if (isFreqChannel(ch) && channelMemberIds(ch).length === 0) {
     channelMeta.delete(ch);
   }
@@ -834,9 +536,6 @@ wss.on('connection', (ws, req) => {
   const geo = getGeoInfo(ip);
   const device = parseDeviceLabel(ua);
 
-  // Track this socket for notice broadcasts and push the current notice
-  // right away — this works even before 'join', so the password screen's
-  // banner has something to show as soon as the app opens a socket.
   rawSockets.add(ws);
   send(ws, noticePayload());
 
@@ -846,39 +545,37 @@ wss.on('connection', (ws, req) => {
 
     if (!authed) {
       if (data.type !== 'join') return;
-      // ALL KILL: refuse every join outright, correct password or not, and
-      // don't even look at data.password. The client must not treat this as
-      // a wrong-password case (no retry prompt) — see 'server-locked' in the
-      // client's handleServerMessage.
+
+      // ALL KILL / 국경봉쇄 / AUTO KICK 판정은 비밀번호 검사보다 먼저
       if (serverLocked) {
         send(ws, { type: 'server-locked' });
         ws.close();
         return;
       }
-      // 국경 봉쇄: 국가가 확인되었고 'KR'이 아니면 즉시 거부. 국가 판별이
-      // 안 된('-') 경우는 차단하지 않는다(geoip 실패로 전원 차단되는 사고
-      // 방지). ALL KILL과 동일한 메시지({type:'server-locked'})를 재사용해
-      // 클라이언트(talkie.html) 쪽 변경 없이도 곧바로 "접속중지" 화면이
-      // 뜨도록 한다.
       if (countryBlockActive && geo.country && geo.country !== '-' && geo.country !== COUNTRY_BLOCK_ALLOW) {
         send(ws, { type: 'server-locked' });
         ws.close();
         return;
       }
-      // AUTO KICK 규칙에 걸리는 접속도 국경 봉쇄와 동일하게 처리 —
-      // 클라이언트(talkie.html) 쪽 변경 없이도 곧바로 "접속중지" 화면이
-      // 뜨도록 {type:'server-locked'}를 그대로 재사용한다.
       if (isAutoKickBlocked({ country: geo.country, region: geo.region, ip, device })) {
         send(ws, { type: 'server-locked' });
         ws.close();
         return;
       }
-      // 시작 비밀번호는 폐기되었다: 누구나 'user'로 접속할 수 있다. 운영자 역할은
-      // 접속 후 {type:'operator-auth'}로 증명하는 것이 기본 경로이며(아래 참고),
-      // 구버전 클라이언트가 join에 운영자 비밀번호를 실어 보낸 경우에만 여기서
-      // 바로 'operator'가 된다. (역할 판정은 전부 서버에서 — 클라이언트는
-      // 'welcome'/'operator-auth-ok'로 자기 역할을 통보받을 뿐이다.)
-      const role = (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) ? 'operator' : 'user';
+
+      // ---- 시작 비밀번호 검증 ----
+      // TALKIE_PASSWORD → role 'user'
+      // TALKIE_OPERATOR_PASSWORD → role 'operator'
+      // 둘 다 아니면 auth-error 후 소켓 즉시 종료
+      let role = null;
+      if (PASSWORD && data.password === PASSWORD) role = 'user';
+      else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) role = 'operator';
+      if (!role) {
+        send(ws, { type: 'auth-error' });
+        ws.close();
+        return;
+      }
+
       authed = true;
       myId = String(nextId++);
       clients.set(myId, {
@@ -896,8 +593,6 @@ wss.on('connection', (ws, req) => {
     if (!me) return;
 
     if (data.type === 'operator-auth') {
-      // "운영자" 닉네임을 고른 클라이언트가 보내는 운영자 비밀번호 확인.
-      // 틀려도 소켓은 닫지 않는다 (클라이언트가 다시 입력할 수 있도록).
       if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) {
         me.role = 'operator';
         send(ws, { type: 'operator-auth-ok' });
@@ -908,23 +603,13 @@ wss.on('connection', (ws, req) => {
     }
 
     if (data.type === 'set-nickname' && typeof data.nickname === 'string') {
-      // Informational only (see the protocol comment at the top of this
-      // file) — purely so talkie-ad.html's 접속자 관리 panel has something
-      // to show. Never used for auth or any access-control decision.
       me.nickname = data.nickname.slice(0, 20) || null;
       return;
     }
 
     if (data.type === 'enter-channel' && typeof data.channel === 'string' && data.channel) {
       const ch = data.channel;
-      // 변동채널(FQ_/SFQ_)은 id 자체가 비밀번호 역할을 하므로, 여기서 매
-      // 시도를 카운트해 무작위 대입 정황이면 즉시 KICK하고 더 진행하지
-      // 않는다(성공/실패 여부와 무관하게 시도 자체를 센다).
       if (isFreqChannel(ch) && checkFreqBruteForce(myId, me)) return;
-      // CH10 (비상 관리채널) requires its own dedicated password on every
-      // entry attempt — independent of both the general and operator join
-      // passwords, and independent of the client's role. Checked here so a
-      // client can't get in just by knowing (or forging) a channel id.
       if (ch === OPERATOR_CHANNEL_ID) {
         if (!CH10_PASSWORD || data.ch10Password !== CH10_PASSWORD) {
           send(ws, { type: 'channel-auth-error', channel: ch });
@@ -932,8 +617,6 @@ wss.on('connection', (ws, req) => {
         }
       }
       if (me.channel === ch) {
-        // Already in it (e.g. a resend after a brief reconnect) — just
-        // re-send the current member list, nothing else changes.
         const peers = channelMemberIds(ch).filter((id) => id !== myId).map((id) => ({ id }));
         send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
         return;
@@ -960,8 +643,6 @@ wss.on('connection', (ws, req) => {
     }
 
     if (data.type === 'set-channel-info' && typeof data.channel === 'string') {
-      // Only the channel you're currently in can have its description/cap
-      // changed, and only by someone actually inside it.
       if (me.channel !== data.channel) return;
       const meta = getChannelMeta(data.channel);
       if (typeof data.desc !== 'undefined') {
@@ -977,8 +658,6 @@ wss.on('connection', (ws, req) => {
 
     if (data.type === 'signal' && data.to) {
       const target = clients.get(data.to);
-      // Only relay within the same channel room — this is what makes the
-      // isolation actually enforced server-side, not just client etiquette.
       if (target && me.channel && target.channel === me.channel) {
         send(target.ws, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
       }
@@ -986,9 +665,6 @@ wss.on('connection', (ws, req) => {
     }
 
     if (data.type === 'ping') {
-      // App-level heartbeat: keeps traffic flowing so idle-timeout proxies
-      // (Render, etc.) don't kill the socket, and lets the client confirm
-      // the connection is actually alive (not just "not yet closed").
       send(ws, { type: 'pong' });
       return;
     }
@@ -998,10 +674,6 @@ wss.on('connection', (ws, req) => {
     rawSockets.delete(ws);
     if (myId && clients.has(myId)) {
       const me = clients.get(myId);
-      // Don't double-log: a kick already recorded its own 'kick' entry
-      // (and the client never gets a chance to reconnect/logout normally
-      // in that same session), so a plain 'logout' entry here would just
-      // be noise on top of it.
       if (!me.wasKicked) logEvent('logout', myId, me);
       if (me.channel) leaveChannel(myId);
       clients.delete(myId);
