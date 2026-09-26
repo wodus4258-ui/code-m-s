@@ -1,7 +1,7 @@
 // Talkie signaling server
 // Implements exactly the protocol documented in the client:
 //   C->S  {type:'join', password:<string>}             -- 시작 비밀번호(일반/운영자). 서버에서 검증.
-//   S->C  {type:'welcome', id, role:'user'|'operator'} -- 비밀번호 일치 시
+//   S->C  {type:'welcome', id, role, publicIp, ipHash} -- 비밀번호 일치 시
 //   S->C  {type:'auth-error'}                          -- 비밀번호 불일치 → 소켓 즉시 닫힘
 //   C->S  {type:'operator-auth', password:<string>}    -- "운영자" 닉네임 선택 시 별도 인증
 //   S->C  {type:'operator-auth-ok'} | {type:'operator-auth-error'}
@@ -9,7 +9,7 @@
 //   C->S  {type:'enter-channel', channel:<id>, ch10Password?:<string>}
 //   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}
 //   S->C  {type:'channel-full', channel}
-//   S->C  {type:'channel-auth-error', channel}         -- CH10 only
+//   S->C  {type:'channel-auth-error', channel, reason?} -- CH10 비밀번호 오류 / LOCAL 네트워크 불일치
 //   C->S  {type:'leave-channel'}
 //   S->C  {type:'peer-joined', channel, id}
 //   S->C  {type:'peer-left', channel, id}
@@ -19,18 +19,24 @@
 //   S->C  {type:'stats', total, channels:{...}}
 //   S->C  {type:'kicked'}                              -- 관리자 KICK
 //   S->C  {type:'server-locked'}                       -- ALL KILL / 국경봉쇄 / AUTO KICK
+//
+// LOCAL 채널
+// ----------
+// 'LOCAL_<iphash>' 또는 'LOCAL_<iphash>_<pin6>' 형식의 채널. iphash는 접속자의
+// public IP를 SHA-256으로 해시한 첫 8자리 hex. 서버는 입장 시 hashIp(me.ip)가
+// 채널 id의 해시와 일치하는지 검증하여 "같은 로컬 네트워크(=같은 공인 IP)"에서만
+// 입장을 허용한다. LOCAL 채널은 인원 상한이 없고(cap 무시), 채널 설명/최대인원
+// 설정도 허용하지 않으며, 인원이 0이 되는 즉시 소멸한다. 통계 브로드캐스트에서는
+// freq 채널과 동일하게 CH10 접속자에게만 노출된다.
 
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 let geoip = null;
 try { geoip = require('geoip-lite'); } catch (e) { geoip = null; }
 
 // ============================================================================
 // 필수 환경변수 강제
-// ----------------------------------------------------------------------------
-// 이전 버전은 `process.env.X || '하드코딩_기본값'` 형태였기 때문에, 배포 시
-// env 등록을 잊어도 서버가 조용히 뜨면서 소스에 노출된 기본 비밀번호로
-// 서비스되는 심각한 보안 문제가 있었다. 이제 값이 없으면 기동을 거부한다.
 // ============================================================================
 function requireEnv(name, description){
   const v = process.env[name];
@@ -55,19 +61,34 @@ const MAX_CHANNEL_CAP = 15;
 const FREQ_CHANNEL_PREFIX = 'FQ_';
 const SECRET_FREQ_CHANNEL_PREFIX = 'SFQ_';
 
-// TALKIE_DECOY: 'o' (또는 미설정) → 위장(디코이) 시작 화면 표시
-//               'x'                → 디코이 건너뛰고 곧바로 로고 화면
 const DECOY_ENABLED = (process.env.TALKIE_DECOY || 'o').toString().toLowerCase() !== 'x';
-
-// 비밀번호 우회 모드:
-// TALKIE_PASSWORD가 정확히 "0000#"인 경우, 클라이언트는 비밀번호 입력창을
-// 띄우지 않고 로고 클릭과 동시에 빈 비밀번호로 join을 시도한다.
 const PASSWORD_BYPASS = (PASSWORD === '0000#');
 
+// ============================================================================
+// 채널 종류 판별 + LOCAL 유틸
+// ----------------------------------------------------------------------------
+// isFreqChannel : 6자리 주파수(FQ_) / 비밀 주파수(SFQ_) 변동채널
+// isLocalChannel: LOCAL_<8hex>[_<6digits>] 로컬(같은 공인 IP) 채널
+// hashIp        : 접속자의 public IP → 8자리 hex (LOCAL 채널 id의 식별자)
+// parseLocalChannel: LOCAL 채널 id를 { hash, pin } 으로 파싱. LOCAL이 아니면 null.
+// ============================================================================
 function isFreqChannel(ch) {
   return typeof ch === 'string' &&
     (ch.indexOf(FREQ_CHANNEL_PREFIX) === 0 || ch.indexOf(SECRET_FREQ_CHANNEL_PREFIX) === 0);
 }
+function hashIp(ip){
+  if(!ip) return '00000000';
+  return crypto.createHash('sha256').update(String(ip)).digest('hex').slice(0, 8);
+}
+function parseLocalChannel(ch){
+  if(typeof ch !== 'string' || ch.indexOf('LOCAL_') !== 0) return null;
+  const rest = ch.slice(6); // 'LOCAL_'.length === 6
+  const m = rest.match(/^([0-9a-f]{8})(?:_([0-9]{6}))?$/);
+  if(!m) return null;
+  return { hash: m[1], pin: m[2] || null };
+}
+function isLocalChannel(ch){ return !!parseLocalChannel(ch); }
+
 const FREQ_ATTEMPT_LIMIT = Number(process.env.TALKIE_FREQ_ATTEMPT_LIMIT) || 20;
 const FREQ_ATTEMPT_WINDOW_MS = Number(process.env.TALKIE_FREQ_ATTEMPT_WINDOW_MS) || 60 * 60 * 1000;
 const FIXED_CHANNEL_IDS = ['CH01','CH02','CH03','CH04','CH05','CH06','CH07','CH08','CH09','CH10'];
@@ -108,11 +129,6 @@ function isAutoKickBlocked(cand) {
 
 // ============================================================================
 // 이벤트 로그 — 24시간 자동 만료
-// ----------------------------------------------------------------------------
-// eventLog는 서버 메모리에만 존재하는 링버퍼다(서버 재시작 시 소멸). 여기에
-// 더해 24시간이 지난 항목은 자동으로 잘라내 개인정보(IP/지역/기기) 보존
-// 기간을 제한한다. 로그는 push 순서대로 시간 오름차순이므로 앞에서부터
-// 잘라내면 된다.
 // ============================================================================
 const eventLog = [];
 const MAX_LOG_ENTRIES = 5000;
@@ -138,7 +154,6 @@ function logEvent(type, id, c, extra) {
   eventLog.push(entry);
   if (eventLog.length > MAX_LOG_ENTRIES) eventLog.splice(0, eventLog.length - MAX_LOG_ENTRIES);
 }
-// 로그 이벤트가 한동안 없어도 만료된 항목이 계속 남아있지 않도록 주기 스윕.
 setInterval(() => pruneEventLog(), 60 * 60 * 1000);
 
 function readBody(req, cb) {
@@ -232,7 +247,7 @@ const server = http.createServer((req, res) => {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
     if (!ADMIN_KEY || key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
-    pruneEventLog(); // 조회 시점에도 한 번 더 잘라내 최신 상태를 반영
+    pruneEventLog();
     sendJson(res, 200, { log: eventLog });
     return;
   }
@@ -378,13 +393,7 @@ const server = http.createServer((req, res) => {
 });
 
 // ============================================================================
-// WebSocket 서버 — maxPayload 상한
-// ----------------------------------------------------------------------------
-// 시그널링 서버는 SDP offer/answer(ICE candidates 포함)와 소량의 제어
-// 메시지만 주고받으므로 정상 페이로드는 수 KB 수준이다. 256KB면 매우
-// 넉넉한 상한이며, 악의적 클라이언트가 거대한 메시지로 서버 메모리를
-// 소진시키는 것을 ws 라이브러리 수준에서 자동 차단한다
-// (초과 시 1009 'Message too big'으로 소켓 종료).
+// WebSocket 서버 — maxPayload 상한 (256KB)
 // ============================================================================
 const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
@@ -465,7 +474,8 @@ function broadcastStats() {
   channelMeta.forEach((meta, ch) => {
     const entry = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
     fullChannels[ch] = entry;
-    if (!isFreqChannel(ch)) publicChannels[ch] = entry;
+    // freq / local 채널은 CH10 접속자에게만 노출 (일반 사용자의 통계에는 미노출)
+    if (!isFreqChannel(ch) && !isLocalChannel(ch)) publicChannels[ch] = entry;
   });
   const fullMsg = JSON.stringify({ type: 'stats', total: clients.size, channels: fullChannels });
   const publicMsg = JSON.stringify({ type: 'stats', total: clients.size, channels: publicChannels });
@@ -583,7 +593,8 @@ function leaveChannel(id) {
   const ch = c.channel;
   c.channel = null;
   broadcastToChannelExcept(ch, id, { type: 'peer-left', channel: ch, id });
-  if (isFreqChannel(ch) && channelMemberIds(ch).length === 0) {
+  // freq / local 채널은 마지막 인원이 나가는 즉시 소멸
+  if ((isFreqChannel(ch) || isLocalChannel(ch)) && channelMemberIds(ch).length === 0) {
     channelMeta.delete(ch);
   }
 }
@@ -606,7 +617,6 @@ wss.on('connection', (ws, req) => {
     if (!authed) {
       if (data.type !== 'join') return;
 
-      // ALL KILL / 국경봉쇄 / AUTO KICK 판정은 비밀번호 검사보다 먼저
       if (serverLocked) {
         send(ws, { type: 'server-locked' });
         ws.close();
@@ -623,10 +633,6 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // ---- 시작 비밀번호 검증 ----
-      // TALKIE_PASSWORD          → role 'user'
-      // TALKIE_OPERATOR_PASSWORD → role 'operator'
-      // TALKIE_PASSWORD === '0000#' 인 bypass 모드에서는 빈 비밀번호도 'user'로 인정.
       let role = null;
       if (PASSWORD_BYPASS && (!data.password || data.password === '')) {
         role = 'user';
@@ -648,7 +654,8 @@ wss.on('connection', (ws, req) => {
         country: geo.country, region: geo.region, city: geo.city, device,
         wasKicked: false, freqAttempts: [],
       });
-      send(ws, { type: 'welcome', id: myId, role });
+      // LOCAL 채널 지원을 위해 접속자의 public IP와 그 hash를 함께 전달
+      send(ws, { type: 'welcome', id: myId, role, publicIp: ip, ipHash: hashIp(ip) });
       logEvent('login', myId, clients.get(myId));
       broadcastStats();
       return;
@@ -675,6 +682,18 @@ wss.on('connection', (ws, req) => {
     if (data.type === 'enter-channel' && typeof data.channel === 'string' && data.channel) {
       const ch = data.channel;
       if (isFreqChannel(ch) && checkFreqBruteForce(myId, me)) return;
+
+      // ---- LOCAL 채널: IP 해시 검증 ----
+      // 채널 id에 담긴 8자리 hex가 이 접속자의 public IP 해시와 일치해야 입장 허용.
+      // 다른 네트워크(다른 공인 IP)에서 초대 링크를 열면 이 지점에서 차단된다.
+      const localInfo = parseLocalChannel(ch);
+      if (localInfo) {
+        if (hashIp(me.ip) !== localInfo.hash) {
+          send(ws, { type: 'channel-auth-error', channel: ch, reason: 'not-same-network' });
+          return;
+        }
+      }
+
       if (ch === OPERATOR_CHANNEL_ID) {
         if (!CH10_PASSWORD || data.ch10Password !== CH10_PASSWORD) {
           send(ws, { type: 'channel-auth-error', channel: ch });
@@ -686,9 +705,11 @@ wss.on('connection', (ws, req) => {
         send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
         return;
       }
+      // LOCAL 채널도 channelMeta에는 등록한다(관리자 페이지/통계용).
+      // 다만 인원 상한은 LOCAL 채널에 한해 적용하지 않는다.
       const meta = getChannelMeta(ch);
       const existing = channelMemberIds(ch);
-      if (existing.length >= meta.cap) {
+      if (!localInfo && existing.length >= meta.cap) {
         send(ws, { type: 'channel-full', channel: ch });
         return;
       }
@@ -709,6 +730,8 @@ wss.on('connection', (ws, req) => {
 
     if (data.type === 'set-channel-info' && typeof data.channel === 'string') {
       if (me.channel !== data.channel) return;
+      // LOCAL 채널은 채널 설명문/최대인원 설정을 지원하지 않는다(입장 상한 없음).
+      if (isLocalChannel(data.channel)) return;
       const meta = getChannelMeta(data.channel);
       if (typeof data.desc !== 'undefined') {
         meta.desc = (typeof data.desc === 'string' && data.desc) ? data.desc.slice(0, 10) : null;
@@ -755,4 +778,5 @@ server.listen(PORT, () => {
   console.log('  passwordBypass    =', PASSWORD_BYPASS, '(TALKIE_PASSWORD === "0000#")');
   console.log('  maxPayload        = 256KB');
   console.log('  log retention     = 24h');
+  console.log('  LOCAL channels    = enabled (hash-based, IP-scoped)');
 });
