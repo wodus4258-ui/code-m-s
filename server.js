@@ -37,6 +37,21 @@ const MIN_FREQ_CHANNEL_CAP = 2;
 const MAX_CHANNEL_CAP = 15;
 const FREQ_CHANNEL_PREFIX = 'FQ_';
 const SECRET_FREQ_CHANNEL_PREFIX = 'SFQ_';
+
+// ============================================================================
+// 새로 추가된 환경변수 기반 설정값
+// ============================================================================
+// TALKIE_DECOY: 'o' (또는 미설정) → 위장(디코이) 시작 화면 표시
+//               'x'                → 디코이 건너뛰고 곧바로 로고 화면
+// 값의 대소문자는 무시하며, 'x'가 아닌 모든 값은 '표시'로 취급한다.
+const DECOY_ENABLED = (process.env.TALKIE_DECOY || 'o').toString().toLowerCase() !== 'x';
+
+// 비밀번호 우회 모드:
+// TALKIE_PASSWORD가 정확히 "0000#"인 경우, 클라이언트는 비밀번호 입력창을
+// 띄우지 않고 로고 클릭과 동시에 빈 비밀번호로 join을 시도한다. 서버는
+// 이 모드에서 빈 비밀번호(또는 실제 값 '0000#')를 정상 접속으로 인정한다.
+const PASSWORD_BYPASS = (PASSWORD === '0000#');
+
 function isFreqChannel(ch) {
   return typeof ch === 'string' &&
     (ch.indexOf(FREQ_CHANNEL_PREFIX) === 0 || ch.indexOf(SECRET_FREQ_CHANNEL_PREFIX) === 0);
@@ -317,8 +332,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /lock-status: 클라이언트가 페이지 로드 시 + 3초마다 폴링하는 공개
+  // 엔드포인트. 이제 serverLocked 뿐 아니라 passwordBypass(TALKIE_PASSWORD가
+  // "0000#"인지)와 decoy(TALKIE_DECOY가 'x'가 아닌지) 여부도 함께 내려준다.
   if (path === '/lock-status' && req.method === 'GET') {
-    sendJson(res, 200, { locked: serverLocked });
+    sendJson(res, 200, {
+      locked: serverLocked,
+      passwordBypass: PASSWORD_BYPASS,
+      decoy: DECOY_ENABLED,
+    });
     return;
   }
 
@@ -564,12 +586,18 @@ wss.on('connection', (ws, req) => {
       }
 
       // ---- 시작 비밀번호 검증 ----
-      // TALKIE_PASSWORD → role 'user'
+      // TALKIE_PASSWORD          → role 'user'
       // TALKIE_OPERATOR_PASSWORD → role 'operator'
-      // 둘 다 아니면 auth-error 후 소켓 즉시 종료
+      // TALKIE_PASSWORD === '0000#' 인 bypass 모드에서는 빈 비밀번호도 'user'로 인정.
       let role = null;
-      if (PASSWORD && data.password === PASSWORD) role = 'user';
-      else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) role = 'operator';
+      if (PASSWORD_BYPASS && (!data.password || data.password === '')) {
+        // bypass 모드: 클라이언트가 빈 비밀번호로 join
+        role = 'user';
+      } else if (PASSWORD && data.password === PASSWORD) {
+        role = 'user';
+      } else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) {
+        role = 'operator';
+      }
       if (!role) {
         send(ws, { type: 'auth-error' });
         ws.close();
@@ -686,4 +714,6 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, () => {
   console.log('Talkie signaling server listening on', PORT);
+  console.log('  TALKIE_DECOY      =', process.env.TALKIE_DECOY || '(unset → decoy ON)');
+  console.log('  passwordBypass    =', PASSWORD_BYPASS, '(TALKIE_PASSWORD === "0000#")');
 });
