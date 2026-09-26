@@ -25,10 +25,27 @@ const { WebSocketServer } = require('ws');
 let geoip = null;
 try { geoip = require('geoip-lite'); } catch (e) { geoip = null; }
 
-const PASSWORD = process.env.TALKIE_PASSWORD || '051627#';
-const OPERATOR_PASSWORD = process.env.TALKIE_OPERATOR_PASSWORD || '051627*';
-const CH10_PASSWORD = process.env.TALKIE_CH10_PASSWORD || '051627@';
-const ADMIN_KEY = process.env.TALKIE_ADMIN_KEY || 'talkie-admin-key-change-me';
+// ============================================================================
+// 필수 환경변수 강제
+// ----------------------------------------------------------------------------
+// 이전 버전은 `process.env.X || '하드코딩_기본값'` 형태였기 때문에, 배포 시
+// env 등록을 잊어도 서버가 조용히 뜨면서 소스에 노출된 기본 비밀번호로
+// 서비스되는 심각한 보안 문제가 있었다. 이제 값이 없으면 기동을 거부한다.
+// ============================================================================
+function requireEnv(name, description){
+  const v = process.env[name];
+  if(!v){
+    console.error('[FATAL] 필수 환경변수 누락: ' + name + (description ? ' ' + description : ''));
+    console.error('        Render 대시보드 Environment 탭에 값을 등록한 뒤 다시 배포하세요.');
+    process.exit(1);
+  }
+  return v;
+}
+const PASSWORD          = requireEnv('TALKIE_PASSWORD',          '(일반 접속 비밀번호)');
+const OPERATOR_PASSWORD = requireEnv('TALKIE_OPERATOR_PASSWORD', '(운영자 인증 비밀번호)');
+const CH10_PASSWORD     = requireEnv('TALKIE_CH10_PASSWORD',     '(CH10 관리채널 입장 비밀번호)');
+const ADMIN_KEY         = requireEnv('TALKIE_ADMIN_KEY',         '(관리자 페이지 ADMIN_KEY)');
+
 const OPERATOR_CHANNEL_ID = 'CH10';
 const PORT = process.env.PORT || 10000;
 const DEFAULT_CHANNEL_CAP = 10;
@@ -38,18 +55,13 @@ const MAX_CHANNEL_CAP = 15;
 const FREQ_CHANNEL_PREFIX = 'FQ_';
 const SECRET_FREQ_CHANNEL_PREFIX = 'SFQ_';
 
-// ============================================================================
-// 새로 추가된 환경변수 기반 설정값
-// ============================================================================
 // TALKIE_DECOY: 'o' (또는 미설정) → 위장(디코이) 시작 화면 표시
 //               'x'                → 디코이 건너뛰고 곧바로 로고 화면
-// 값의 대소문자는 무시하며, 'x'가 아닌 모든 값은 '표시'로 취급한다.
 const DECOY_ENABLED = (process.env.TALKIE_DECOY || 'o').toString().toLowerCase() !== 'x';
 
 // 비밀번호 우회 모드:
 // TALKIE_PASSWORD가 정확히 "0000#"인 경우, 클라이언트는 비밀번호 입력창을
-// 띄우지 않고 로고 클릭과 동시에 빈 비밀번호로 join을 시도한다. 서버는
-// 이 모드에서 빈 비밀번호(또는 실제 값 '0000#')를 정상 접속으로 인정한다.
+// 띄우지 않고 로고 클릭과 동시에 빈 비밀번호로 join을 시도한다.
 const PASSWORD_BYPASS = (PASSWORD === '0000#');
 
 function isFreqChannel(ch) {
@@ -94,9 +106,26 @@ function isAutoKickBlocked(cand) {
   return autoKickRules.some((r) => ruleMatchesCandidate(r, cand));
 }
 
+// ============================================================================
+// 이벤트 로그 — 24시간 자동 만료
+// ----------------------------------------------------------------------------
+// eventLog는 서버 메모리에만 존재하는 링버퍼다(서버 재시작 시 소멸). 여기에
+// 더해 24시간이 지난 항목은 자동으로 잘라내 개인정보(IP/지역/기기) 보존
+// 기간을 제한한다. 로그는 push 순서대로 시간 오름차순이므로 앞에서부터
+// 잘라내면 된다.
+// ============================================================================
 const eventLog = [];
 const MAX_LOG_ENTRIES = 5000;
+const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function pruneEventLog(now){
+  const cutoff = (now || Date.now()) - LOG_MAX_AGE_MS;
+  let i = 0;
+  while(i < eventLog.length && eventLog[i].ts < cutoff) i++;
+  if(i > 0) eventLog.splice(0, i);
+}
 function logEvent(type, id, c, extra) {
+  pruneEventLog();
   const entry = Object.assign({
     type, id, ts: Date.now(),
     nickname: c ? (c.nickname || null) : null,
@@ -109,6 +138,8 @@ function logEvent(type, id, c, extra) {
   eventLog.push(entry);
   if (eventLog.length > MAX_LOG_ENTRIES) eventLog.splice(0, eventLog.length - MAX_LOG_ENTRIES);
 }
+// 로그 이벤트가 한동안 없어도 만료된 항목이 계속 남아있지 않도록 주기 스윕.
+setInterval(() => pruneEventLog(), 60 * 60 * 1000);
 
 function readBody(req, cb) {
   let body = '';
@@ -201,6 +232,7 @@ const server = http.createServer((req, res) => {
     let key = null;
     try { key = new URL(req.url, 'http://x').searchParams.get('key'); } catch (e) {}
     if (!ADMIN_KEY || key !== ADMIN_KEY) { sendJson(res, 401, { error: 'unauthorized' }); return; }
+    pruneEventLog(); // 조회 시점에도 한 번 더 잘라내 최신 상태를 반영
     sendJson(res, 200, { log: eventLog });
     return;
   }
@@ -332,9 +364,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // /lock-status: 클라이언트가 페이지 로드 시 + 3초마다 폴링하는 공개
-  // 엔드포인트. 이제 serverLocked 뿐 아니라 passwordBypass(TALKIE_PASSWORD가
-  // "0000#"인지)와 decoy(TALKIE_DECOY가 'x'가 아닌지) 여부도 함께 내려준다.
   if (path === '/lock-status' && req.method === 'GET') {
     sendJson(res, 200, {
       locked: serverLocked,
@@ -348,7 +377,16 @@ const server = http.createServer((req, res) => {
   res.end('Talkie signaling server OK');
 });
 
-const wss = new WebSocketServer({ server });
+// ============================================================================
+// WebSocket 서버 — maxPayload 상한
+// ----------------------------------------------------------------------------
+// 시그널링 서버는 SDP offer/answer(ICE candidates 포함)와 소량의 제어
+// 메시지만 주고받으므로 정상 페이로드는 수 KB 수준이다. 256KB면 매우
+// 넉넉한 상한이며, 악의적 클라이언트가 거대한 메시지로 서버 메모리를
+// 소진시키는 것을 ws 라이브러리 수준에서 자동 차단한다
+// (초과 시 1009 'Message too big'으로 소켓 종료).
+// ============================================================================
+const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
 let nextId = 1;
 const clients = new Map();
@@ -591,7 +629,6 @@ wss.on('connection', (ws, req) => {
       // TALKIE_PASSWORD === '0000#' 인 bypass 모드에서는 빈 비밀번호도 'user'로 인정.
       let role = null;
       if (PASSWORD_BYPASS && (!data.password || data.password === '')) {
-        // bypass 모드: 클라이언트가 빈 비밀번호로 join
         role = 'user';
       } else if (PASSWORD && data.password === PASSWORD) {
         role = 'user';
@@ -716,4 +753,6 @@ server.listen(PORT, () => {
   console.log('Talkie signaling server listening on', PORT);
   console.log('  TALKIE_DECOY      =', process.env.TALKIE_DECOY || '(unset → decoy ON)');
   console.log('  passwordBypass    =', PASSWORD_BYPASS, '(TALKIE_PASSWORD === "0000#")');
+  console.log('  maxPayload        = 256KB');
+  console.log('  log retention     = 24h');
 });
