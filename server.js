@@ -13,12 +13,9 @@
 //   C->S  {type:'leave-channel'}
 //   S->C  {type:'peer-joined', channel, id}
 //   S->C  {type:'peer-left', channel, id}
-//   C->S  {type:'signal', to:<peerId>, kind, payload}   -- (nickname 필드 자동 첨부)
-//   S->C  {type:'signal', from:<peerId>, kind, payload, nickname}  -- nickname 릴레이
+//   C->S  {type:'signal', to:<peerId>, kind, payload}
+//   S->C  {type:'signal', from:<peerId>, kind, payload}
 //   C->S  {type:'set-channel-info', channel, desc, cap}
-//   C->S  {type:'channel-resync', channel}              -- 수동 채널 재동기화 요청
-//   S->C  {type:'channel-resync-roster', channel, peers:[{id},...]}
-//   S->C  {type:'channel-resync-error', reason}
 //   S->C  {type:'stats', total, channels:{...}}
 //   S->C  {type:'kicked'}                              -- 관리자 KICK
 //   S->C  {type:'server-locked'}                       -- ALL KILL / 국경봉쇄 / AUTO KICK
@@ -747,42 +744,10 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // ---- 채널 재동기화 ----
-    // 클라이언트가 pill 클릭 등으로 "지금 이 채널에 누가 있나?" 물어보면,
-    // 서버가 권위 있는 로스터를 반환한다. 동시에 채널 내 다른 사람들에게도
-    // "이 사람 아직 여기 있음"을 peer-joined로 재확인시켜, 어느 한쪽의
-    // 로컬 peer 목록이 어긋나 있어도 강제로 다시 맞춰지게 한다.
-    // peer-joined는 클라이언트 측 registerPeer가 idempotent라 재전송이 안전하다.
-    if (data.type === 'channel-resync') {
-      if (!me.channel || me.channel !== data.channel) {
-        send(ws, { type: 'channel-resync-error', reason: 'not-in-channel' });
-        return;
-      }
-      const roster = [];
-      clients.forEach((c, id) => {
-        if (c.channel === data.channel) roster.push({ id });
-      });
-      send(ws, {
-        type: 'channel-resync-roster',
-        channel: data.channel,
-        peers: roster
-      });
-      // 채널 내 다른 사람들에게 이 사람이 여전히 여기 있음을 재확인.
-      clients.forEach((c, id) => {
-        if (id !== myId && c.channel === data.channel) {
-          send(c.ws, { type: 'peer-joined', channel: data.channel, id: myId });
-        }
-      });
-      return;
-    }
-
     if (data.type === 'signal' && data.to) {
       const target = clients.get(data.to);
       if (target && me.channel && target.channel === me.channel) {
-        send(target.ws, {
-          type: 'signal', from: myId, kind: data.kind, payload: data.payload,
-          nickname: me.nickname || null
-        });
+        send(target.ws, { type: 'signal', from: myId, kind: data.kind, payload: data.payload });
       }
       return;
     }
