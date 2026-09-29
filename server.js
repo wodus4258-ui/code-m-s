@@ -1,15 +1,15 @@
 // Talkie signaling server
 // Implements exactly the protocol documented in the client:
-//   C->S  {type:'join', password:<string>}             -- 시작 비밀번호(일반/운영자). 서버에서 검증.
-//   S->C  {type:'welcome', id, role, publicIp, ipHash} -- 비밀번호 일치 시
-//   S->C  {type:'auth-error'}                          -- 비밀번호 불일치 → 소켓 즉시 닫힘
-//   C->S  {type:'operator-auth', password:<string>}    -- "운영자" 닉네임 선택 시 별도 인증
+//   C->S  {type:'join', password:<string>, jwt?:<string>}  -- 비회원: password / 회원: jwt
+//   S->C  {type:'welcome', id, role, publicIp, ipHash, memberUserId}
+//   S->C  {type:'auth-error'}
+//   C->S  {type:'operator-auth', password:<string>}
 //   S->C  {type:'operator-auth-ok'} | {type:'operator-auth-error'}
 //   C->S  {type:'set-nickname', nickname:<string>}
 //   C->S  {type:'enter-channel', channel:<id>, ch10Password?:<string>}
 //   S->C  {type:'channel-welcome', channel, id, peers:[{id}, ...]}
 //   S->C  {type:'channel-full', channel}
-//   S->C  {type:'channel-auth-error', channel, reason?} -- CH10 비밀번호 오류 / LOCAL 네트워크 불일치
+//   S->C  {type:'channel-auth-error', channel, reason?}
 //   C->S  {type:'leave-channel'}
 //   S->C  {type:'peer-joined', channel, id}
 //   S->C  {type:'peer-left', channel, id}
@@ -17,17 +17,16 @@
 //   S->C  {type:'signal', from:<peerId>, kind, payload}
 //   C->S  {type:'set-channel-info', channel, desc, cap}
 //   S->C  {type:'stats', total, channels:{...}}
-//   S->C  {type:'kicked'}                              -- 관리자 KICK
-//   S->C  {type:'server-locked'}                       -- ALL KILL / 국경봉쇄 / AUTO KICK
+//   S->C  {type:'kicked'}
+//   S->C  {type:'server-locked'}
 //
-// LOCAL 채널
-// ----------
-// 'LOCAL_<iphash>' 또는 'LOCAL_<iphash>_<pin6>' 형식의 채널. iphash는 접속자의
-// public IP를 SHA-256으로 해시한 첫 8자리 hex. 서버는 입장 시 hashIp(me.ip)가
-// 채널 id의 해시와 일치하는지 검증하여 "같은 로컬 네트워크(=같은 공인 IP)"에서만
-// 입장을 허용한다. LOCAL 채널은 인원 상한이 없고(cap 무시), 채널 설명/최대인원
-// 설정도 허용하지 않으며, 인원이 0이 되는 즉시 소멸한다. 통계 브로드캐스트에서는
-// freq 채널과 동일하게 CH10 접속자에게만 노출된다.
+// 회원 로그인 (JWT)
+// -----------------
+// 클라이언트가 Supabase Auth로 로그인한 뒤 받은 access_token(JWT)을 join 시
+// 함께 보내면, 서버가 SUPABASE_JWT_SECRET으로 서명을 검증한다. 통과하면
+// role='user' + memberUserId(UUID)로 세션을 열고, welcome 메시지에 UUID를
+// 실어 보낸다. JWT가 없거나 검증 실패면 기존 비밀번호 경로로 폴백하므로
+// 비회원 흐름은 전혀 영향받지 않는다.
 
 const http = require('http');
 const crypto = require('crypto');
@@ -52,6 +51,9 @@ const OPERATOR_PASSWORD = requireEnv('TALKIE_OPERATOR_PASSWORD', '(운영자 인
 const CH10_PASSWORD     = requireEnv('TALKIE_CH10_PASSWORD',     '(CH10 관리채널 입장 비밀번호)');
 const ADMIN_KEY         = requireEnv('TALKIE_ADMIN_KEY',         '(관리자 페이지 ADMIN_KEY)');
 
+// 회원 JWT 검증용. 없으면 회원 로그인만 비활성화되고 비회원 흐름은 정상.
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || null;
+
 const OPERATOR_CHANNEL_ID = 'CH10';
 const PORT = process.env.PORT || 10000;
 const DEFAULT_CHANNEL_CAP = 10;
@@ -66,11 +68,6 @@ const PASSWORD_BYPASS = (PASSWORD === '0000#');
 
 // ============================================================================
 // 채널 종류 판별 + LOCAL 유틸
-// ----------------------------------------------------------------------------
-// isFreqChannel : 6자리 주파수(FQ_) / 비밀 주파수(SFQ_) 변동채널
-// isLocalChannel: LOCAL_<8hex>[_<6digits>] 로컬(같은 공인 IP) 채널
-// hashIp        : 접속자의 public IP → 8자리 hex (LOCAL 채널 id의 식별자)
-// parseLocalChannel: LOCAL 채널 id를 { hash, pin } 으로 파싱. LOCAL이 아니면 null.
 // ============================================================================
 function isFreqChannel(ch) {
   return typeof ch === 'string' &&
@@ -82,12 +79,50 @@ function hashIp(ip){
 }
 function parseLocalChannel(ch){
   if(typeof ch !== 'string' || ch.indexOf('LOCAL_') !== 0) return null;
-  const rest = ch.slice(6); // 'LOCAL_'.length === 6
+  const rest = ch.slice(6);
   const m = rest.match(/^([0-9a-f]{8})(?:_([0-9]{6}))?$/);
   if(!m) return null;
   return { hash: m[1], pin: m[2] || null };
 }
 function isLocalChannel(ch){ return !!parseLocalChannel(ch); }
+
+// ============================================================================
+// Supabase JWT 검증 (HS256)
+// ============================================================================
+function base64UrlDecode(str){
+  str = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while(str.length % 4) str += '=';
+  return Buffer.from(str, 'base64');
+}
+function verifySupabaseJWT(token, secret){
+  try{
+    if(!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if(parts.length !== 3) return null;
+    const headerB64 = parts[0], payloadB64 = parts[1], signatureB64 = parts[2];
+
+    // 1) 서명 검증 (타이밍 안전 비교)
+    const signatureInput = headerB64 + '.' + payloadB64;
+    const expectedSig = crypto.createHmac('sha256', secret).update(signatureInput).digest();
+    const actualSig = base64UrlDecode(signatureB64);
+    if(expectedSig.length !== actualSig.length) return null;
+    if(!crypto.timingSafeEqual(expectedSig, actualSig)) return null;
+
+    // 2) 헤더 검증
+    const header = JSON.parse(base64UrlDecode(headerB64).toString('utf8'));
+    if(header.alg !== 'HS256') return null;
+
+    // 3) 페이로드 검증
+    const payload = JSON.parse(base64UrlDecode(payloadB64).toString('utf8'));
+    if(payload.exp && (payload.exp * 1000) < Date.now()) return null;
+    if(payload.aud !== 'authenticated') return null;
+    if(!payload.sub) return null;
+
+    return payload;
+  }catch(e){
+    return null;
+  }
+}
 
 const FREQ_ATTEMPT_LIMIT = Number(process.env.TALKIE_FREQ_ATTEMPT_LIMIT) || 20;
 const FREQ_ATTEMPT_WINDOW_MS = Number(process.env.TALKIE_FREQ_ATTEMPT_WINDOW_MS) || 60 * 60 * 1000;
@@ -237,6 +272,7 @@ const server = http.createServer((req, res) => {
         region: c.region || null,
         city: c.city || null,
         device: c.device || null,
+        isMember: !!c.memberUserId,
       });
     });
     sendJson(res, 200, { total: clients.size, channels: channelsOut, clients: clientsOut, locked: serverLocked, countryBlocked: countryBlockActive });
@@ -474,7 +510,6 @@ function broadcastStats() {
   channelMeta.forEach((meta, ch) => {
     const entry = { desc: meta.desc, cap: meta.cap, count: channelMemberIds(ch).length };
     fullChannels[ch] = entry;
-    // freq / local 채널은 CH10 접속자에게만 노출 (일반 사용자의 통계에는 미노출)
     if (!isFreqChannel(ch) && !isLocalChannel(ch)) publicChannels[ch] = entry;
   });
   const fullMsg = JSON.stringify({ type: 'stats', total: clients.size, channels: fullChannels });
@@ -593,7 +628,6 @@ function leaveChannel(id) {
   const ch = c.channel;
   c.channel = null;
   broadcastToChannelExcept(ch, id, { type: 'peer-left', channel: ch, id });
-  // freq / local 채널은 마지막 인원이 나가는 즉시 소멸
   if ((isFreqChannel(ch) || isLocalChannel(ch)) && channelMemberIds(ch).length === 0) {
     channelMeta.delete(ch);
   }
@@ -634,13 +668,28 @@ wss.on('connection', (ws, req) => {
       }
 
       let role = null;
-      if (PASSWORD_BYPASS && (!data.password || data.password === '')) {
-        role = 'user';
-      } else if (PASSWORD && data.password === PASSWORD) {
-        role = 'user';
-      } else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) {
-        role = 'operator';
+      let memberUserId = null; // 회원이면 Supabase user UUID, 비회원이면 null
+
+      // 1) 회원 경로: JWT가 있으면 서명 검증
+      if (data.jwt && SUPABASE_JWT_SECRET) {
+        const payload = verifySupabaseJWT(data.jwt, SUPABASE_JWT_SECRET);
+        if (payload) {
+          role = 'user';
+          memberUserId = payload.sub;
+        }
       }
+
+      // 2) 비회원 경로: JWT 없거나 검증 실패 시 기존 비밀번호 검증으로 폴백
+      if (!role) {
+        if (PASSWORD_BYPASS && (!data.password || data.password === '')) {
+          role = 'user';
+        } else if (PASSWORD && data.password === PASSWORD) {
+          role = 'user';
+        } else if (OPERATOR_PASSWORD && data.password === OPERATOR_PASSWORD) {
+          role = 'operator';
+        }
+      }
+
       if (!role) {
         send(ws, { type: 'auth-error' });
         ws.close();
@@ -653,9 +702,16 @@ wss.on('connection', (ws, req) => {
         ws, channel: null, role, ip, connectedAt: Date.now(), nickname: null,
         country: geo.country, region: geo.region, city: geo.city, device,
         wasKicked: false, freqAttempts: [],
+        memberUserId,
       });
-      // LOCAL 채널 지원을 위해 접속자의 public IP와 그 hash를 함께 전달
-      send(ws, { type: 'welcome', id: myId, role, publicIp: ip, ipHash: hashIp(ip) });
+      send(ws, {
+        type: 'welcome',
+        id: myId,
+        role,
+        publicIp: ip,
+        ipHash: hashIp(ip),
+        memberUserId,
+      });
       logEvent('login', myId, clients.get(myId));
       broadcastStats();
       return;
@@ -683,9 +739,6 @@ wss.on('connection', (ws, req) => {
       const ch = data.channel;
       if (isFreqChannel(ch) && checkFreqBruteForce(myId, me)) return;
 
-      // ---- LOCAL 채널: IP 해시 검증 ----
-      // 채널 id에 담긴 8자리 hex가 이 접속자의 public IP 해시와 일치해야 입장 허용.
-      // 다른 네트워크(다른 공인 IP)에서 초대 링크를 열면 이 지점에서 차단된다.
       const localInfo = parseLocalChannel(ch);
       if (localInfo) {
         if (hashIp(me.ip) !== localInfo.hash) {
@@ -705,8 +758,6 @@ wss.on('connection', (ws, req) => {
         send(ws, { type: 'channel-welcome', channel: ch, id: myId, peers });
         return;
       }
-      // LOCAL 채널도 channelMeta에는 등록한다(관리자 페이지/통계용).
-      // 다만 인원 상한은 LOCAL 채널에 한해 적용하지 않는다.
       const meta = getChannelMeta(ch);
       const existing = channelMemberIds(ch);
       if (!localInfo && existing.length >= meta.cap) {
@@ -730,7 +781,6 @@ wss.on('connection', (ws, req) => {
 
     if (data.type === 'set-channel-info' && typeof data.channel === 'string') {
       if (me.channel !== data.channel) return;
-      // LOCAL 채널은 채널 설명문/최대인원 설정을 지원하지 않는다(입장 상한 없음).
       if (isLocalChannel(data.channel)) return;
       const meta = getChannelMeta(data.channel);
       if (typeof data.desc !== 'undefined') {
@@ -779,4 +829,5 @@ server.listen(PORT, () => {
   console.log('  maxPayload        = 256KB');
   console.log('  log retention     = 24h');
   console.log('  LOCAL channels    = enabled (hash-based, IP-scoped)');
+  console.log('  member JWT auth   =', SUPABASE_JWT_SECRET ? 'enabled' : 'disabled (no SUPABASE_JWT_SECRET)');
 });
