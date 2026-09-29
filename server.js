@@ -53,6 +53,26 @@ const ADMIN_KEY         = requireEnv('TALKIE_ADMIN_KEY',         '(관리자 페
 
 // 회원 JWT 검증용. 없으면 회원 로그인만 비활성화되고 비회원 흐름은 정상.
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || null;
+const SUPABASE_URL = process.env.SUPABASE_URL || null;
+
+let supabaseJwks = null;
+let supabaseJwksFetchedAt = 0;
+async function fetchSupabaseJwks(force){
+  if(!SUPABASE_URL) return null;
+  const now = Date.now();
+  if(!force && supabaseJwks && (now - supabaseJwksFetchedAt < 3600000)) return supabaseJwks;
+  try{
+    const url = SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/.well-known/jwks.json';
+    const res = await fetch(url);
+    if(!res.ok) return null;
+    const data = await res.json();
+    supabaseJwks = data;
+    supabaseJwksFetchedAt = now;
+    return data;
+  }catch(e){
+    return null;
+  }
+}
 
 const OPERATOR_CHANNEL_ID = 'CH10';
 const PORT = process.env.PORT || 10000;
@@ -94,31 +114,53 @@ function base64UrlDecode(str){
   while(str.length % 4) str += '=';
   return Buffer.from(str, 'base64');
 }
-function verifySupabaseJWT(token, secret){
+async function verifySupabaseJWT(token){
   try{
     if(!token || typeof token !== 'string') return null;
     const parts = token.split('.');
     if(parts.length !== 3) return null;
     const headerB64 = parts[0], payloadB64 = parts[1], signatureB64 = parts[2];
-
-    // 1) 서명 검증 (타이밍 안전 비교)
-    const signatureInput = headerB64 + '.' + payloadB64;
-    const expectedSig = crypto.createHmac('sha256', secret).update(signatureInput).digest();
-    const actualSig = base64UrlDecode(signatureB64);
-    if(expectedSig.length !== actualSig.length) return null;
-    if(!crypto.timingSafeEqual(expectedSig, actualSig)) return null;
-
-    // 2) 헤더 검증
-    const header = JSON.parse(base64UrlDecode(headerB64).toString('utf8'));
-    if(header.alg !== 'HS256') return null;
-
-    // 3) 페이로드 검증
-    const payload = JSON.parse(base64UrlDecode(payloadB64).toString('utf8'));
+    let header, payload;
+    try{
+      header = JSON.parse(base64UrlDecode(headerB64).toString('utf8'));
+      payload = JSON.parse(base64UrlDecode(payloadB64).toString('utf8'));
+    }catch(e){ return null; }
     if(payload.exp && (payload.exp * 1000) < Date.now()) return null;
     if(payload.aud !== 'authenticated') return null;
     if(!payload.sub) return null;
-
-    return payload;
+    const signatureInput = headerB64 + '.' + payloadB64;
+    const signature = base64UrlDecode(signatureB64);
+    if(header.alg === 'HS256'){
+      if(!SUPABASE_JWT_SECRET) return null;
+      const expected = crypto.createHmac('sha256', SUPABASE_JWT_SECRET).update(signatureInput).digest();
+      if(expected.length !== signature.length) return null;
+      if(!crypto.timingSafeEqual(expected, signature)) return null;
+      return payload;
+    }
+    if(header.alg === 'ES256' || header.alg === 'RS256'){
+      let jwks = await fetchSupabaseJwks(false);
+      let keys = (jwks && jwks.keys) || [];
+      let jwk = header.kid ? keys.find(k => k.kid === header.kid) : null;
+      if(!jwk && keys.length === 1) jwk = keys[0];
+      if(!jwk){
+        jwks = await fetchSupabaseJwks(true);
+        keys = (jwks && jwks.keys) || [];
+        jwk = header.kid ? keys.find(k => k.kid === header.kid) : null;
+        if(!jwk && keys.length === 1) jwk = keys[0];
+      }
+      if(!jwk) return null;
+      const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+      const data = Buffer.from(signatureInput, 'utf8');
+      let ok = false;
+      if(header.alg === 'ES256'){
+        ok = crypto.verify('sha256', data, { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
+      } else {
+        ok = crypto.verify('sha256', data, publicKey, signature);
+      }
+      if(!ok) return null;
+      return payload;
+    }
+    return null;
   }catch(e){
     return null;
   }
@@ -644,7 +686,7 @@ wss.on('connection', (ws, req) => {
   rawSockets.add(ws);
   send(ws, noticePayload());
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw); } catch (e) { return; }
 
@@ -671,8 +713,8 @@ wss.on('connection', (ws, req) => {
       let memberUserId = null; // 회원이면 Supabase user UUID, 비회원이면 null
 
       // 1) 회원 경로: JWT가 있으면 서명 검증
-      if (data.jwt && SUPABASE_JWT_SECRET) {
-        const payload = verifySupabaseJWT(data.jwt, SUPABASE_JWT_SECRET);
+      if (data.jwt) {
+        const payload = await verifySupabaseJWT(data.jwt);
         if (payload) {
           role = 'user';
           memberUserId = payload.sub;
@@ -830,4 +872,5 @@ server.listen(PORT, () => {
   console.log('  log retention     = 24h');
   console.log('  LOCAL channels    = enabled (hash-based, IP-scoped)');
   console.log('  member JWT auth   =', SUPABASE_JWT_SECRET ? 'enabled' : 'disabled (no SUPABASE_JWT_SECRET)');
+  console.log(' SUPABASE_URL =', SUPABASE_URL || '(unset → JWKS 검증 불가)');
 });
