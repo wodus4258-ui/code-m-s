@@ -20,6 +20,17 @@
 //   S->C  {type:'kicked'}
 //   S->C  {type:'server-locked'}
 //
+// K방법 + Presence (WS 기반 친구 알림)
+// ------------------------------------
+//   C->S  {type:'notify-member', targetMemberUserId:<UUID>}
+//   S->C  {type:'friend-update'}            -- 대상 UUID의 모든 WS에 브로드캐스트
+//   C->S  {type:'query-presence', memberUserIds:[<UUID>, ...]}
+//   S->C  {type:'presence-query-result', online:{<UUID>:bool, ...}}
+//   S->C  {type:'presence-update', memberUserId:<UUID>, online:<bool>}
+// 서버는 memberIdToClientId Map<UUID, Set<clientId>>을 메모리에 유지한다.
+// welcome 시 자동 등록, close 시 자동 해제하며, 마지막 탭이 닫히면
+// presence-update(offline)를 브로드캐스트한다.
+//
 // 회원 로그인 (JWT)
 // -----------------
 // 클라이언트가 Supabase Auth로 로그인한 뒤 받은 access_token(JWT)을 join 시
@@ -107,7 +118,7 @@ function parseLocalChannel(ch){
 function isLocalChannel(ch){ return !!parseLocalChannel(ch); }
 
 // ============================================================================
-// Supabase JWT 검증 (HS256)
+// Supabase JWT 검증 (HS256 / ES256 / RS256)
 // ============================================================================
 function base64UrlDecode(str){
   str = String(str).replace(/-/g, '+').replace(/_/g, '/');
@@ -479,6 +490,9 @@ let nextId = 1;
 const clients = new Map();
 const channelMeta = new Map();
 const rawSockets = new Set();
+// K방법 + Presence: 회원 UUID -> Set<clientId>
+// 같은 회원이 여러 탭/기기로 접속하면 Set에 여러 clientId가 들어간다.
+const memberIdToClientId = new Map();
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
@@ -544,6 +558,20 @@ function broadcastToChannelExcept(ch, exceptId, obj) {
 function broadcastNotice() {
   const msg = JSON.stringify(noticePayload());
   rawSockets.forEach((s) => { try { s.send(msg); } catch (e) {} });
+}
+
+// K방법 + Presence: 특정 UUID의 상태 변화(online/offline)를
+// memberIdToClientId에 등록된 모든 회원 WS에 브로드캐스트한다.
+// 즉 A가 오프라인이 되면, A와 친구인 B/C/D 등 접속 중인 모든 회원에게 알림이 간다.
+// (친구 여부는 클라이언트가 판단해서 자기 친구 목록에 반영한다.)
+function broadcastPresence(memberUserId, online) {
+  const msg = JSON.stringify({ type: 'presence-update', memberUserId, online });
+  memberIdToClientId.forEach((set) => {
+    set.forEach((cid) => {
+      const c = clients.get(cid);
+      if (c) { try { c.ws.send(msg); } catch (e) {} }
+    });
+  });
 }
 
 function broadcastStats() {
@@ -746,6 +774,16 @@ wss.on('connection', (ws, req) => {
         wasKicked: false, freqAttempts: [],
         memberUserId,
       });
+      // K방법: 회원이면 memberIdToClientId에 자동 등록.
+      // join 처리 중 async await 때문에 클라이언트가 별도 register-member를
+      // 보내면 타이밍이 어긋나 드랍될 수 있어, 서버가 welcome 시점에 직접 등록한다.
+      if (memberUserId) {
+        let set = memberIdToClientId.get(memberUserId);
+        const wasOffline = !set || set.size === 0;
+        if (!set) { set = new Set(); memberIdToClientId.set(memberUserId, set); }
+        set.add(myId);
+        if (wasOffline) broadcastPresence(memberUserId, true);
+      }
       send(ws, {
         type: 'welcome',
         id: myId,
@@ -774,6 +812,32 @@ wss.on('connection', (ws, req) => {
 
     if (data.type === 'set-nickname' && typeof data.nickname === 'string') {
       me.nickname = data.nickname.slice(0, 20) || null;
+      return;
+    }
+
+    // ====================================================================
+    // K방법: 친구 관련 변경 알림 — 상대방 UUID의 모든 WS에 friend-update 전송
+    // ====================================================================
+    if (data.type === 'notify-member' && typeof data.targetMemberUserId === 'string') {
+      const set = memberIdToClientId.get(data.targetMemberUserId);
+      if (set) {
+        set.forEach((cid) => {
+          const target = clients.get(cid);
+          if (target) send(target.ws, { type: 'friend-update' });
+        });
+      }
+      return;
+    }
+
+    // ====================================================================
+    // Presence 조회: 클라이언트가 친구 UUID 목록을 보내면 온라인 여부 응답
+    // ====================================================================
+    if (data.type === 'query-presence' && Array.isArray(data.memberUserIds)) {
+      const online = {};
+      data.memberUserIds.forEach((uid) => {
+        if (typeof uid === 'string') online[uid] = memberIdToClientId.has(uid);
+      });
+      send(ws, { type: 'presence-query-result', online });
       return;
     }
 
@@ -856,6 +920,17 @@ wss.on('connection', (ws, req) => {
       const me = clients.get(myId);
       if (!me.wasKicked) logEvent('logout', myId, me);
       if (me.channel) leaveChannel(myId);
+      // K방법 + Presence: 해제 + 마지막 탭이면 오프라인 브로드캐스트
+      if (me.memberUserId) {
+        const set = memberIdToClientId.get(me.memberUserId);
+        if (set) {
+          set.delete(myId);
+          if (set.size === 0) {
+            memberIdToClientId.delete(me.memberUserId);
+            broadcastPresence(me.memberUserId, false);
+          }
+        }
+      }
       clients.delete(myId);
       broadcastStats();
     }
@@ -871,6 +946,7 @@ server.listen(PORT, () => {
   console.log('  maxPayload        = 256KB');
   console.log('  log retention     = 24h');
   console.log('  LOCAL channels    = enabled (hash-based, IP-scoped)');
+  console.log('  K방법 + Presence   = enabled (memberIdToClientId)');
   console.log('  member JWT auth   =', SUPABASE_JWT_SECRET ? 'enabled' : 'disabled (no SUPABASE_JWT_SECRET)');
-  console.log(' SUPABASE_URL =', SUPABASE_URL || '(unset → JWKS 검증 불가)');
+  console.log('  SUPABASE_URL      =', SUPABASE_URL || '(unset → JWKS 검증 불가)');
 });
